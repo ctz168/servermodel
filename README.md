@@ -1,10 +1,12 @@
 # 分布式大模型推理系统
 
+
 <div align="center">
 
 **一键安装 · 跨平台支持 · 傻瓜式使用**
 
 一个轻量级、生产级的分布式大模型推理系统，支持多节点协同推理。
+
 
 </div>
 
@@ -67,9 +69,10 @@ dllm-start
 ~/.distributed-llm/start.sh
 
 # 方式3: 指定模式
-./start.sh resource_aware   # 资源感知模式
-./start.sh pipeline         # Pipeline模式
-./start.sh decentralized    # 去中心化模式
+./start.sh unified        # 统一去中心化模式（推荐）
+./start.sh resource_aware # 资源感知模式
+./start.sh pipeline       # Pipeline模式
+./start.sh decentralized  # 去中心化模式
 ```
 
 **Windows:**
@@ -105,9 +108,40 @@ status.bat
 
 ---
 
-## 📋 四种运行模式
+## 📋 五种运行模式
 
-### 1. 资源感知模式（推荐）
+### 1. 统一去中心化模式（推荐）⭐
+
+**特点：自动发现、自动选举、统一API**
+
+- 任意节点启动，自动检测其他节点
+- 第一个节点自动成为领导节点
+- Raft共识算法保证高可用
+- 领导节点提供统一API入口
+- 支持联合分布式推理
+- 故障自动恢复
+
+```bash
+# 第一个节点（自动成为领导）
+python download/node_unified.py --port 5000 --api-port 8080
+
+# 后续节点（自动发现并加入）
+python download/node_unified.py --port 5001 --seeds "localhost:5000"
+
+# 或使用启动脚本
+./scripts/start_unified.sh 3  # 启动3个节点
+```
+
+**API端点（领导节点）:**
+```
+POST /inference - 提交推理请求
+POST /task      - 提交异步任务
+GET  /status    - 获取节点状态
+GET  /nodes     - 获取节点列表
+GET  /stats     - 获取统计信息
+```
+
+### 2. 资源感知模式
 
 **特点：自动检测资源，智能启停**
 
@@ -121,7 +155,7 @@ status.bat
 python download/node_resource_aware.py --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-### 2. Pipeline并行模式
+### 3. Pipeline并行模式
 
 **特点：多节点分片，内存最优**
 
@@ -139,7 +173,7 @@ python download/node_resource_aware.py --model Qwen/Qwen2.5-0.5B-Instruct
 # 输入: 节点索引=1, 总节点数=2
 ```
 
-### 3. 去中心化模式
+### 4. 去中心化模式
 
 **特点：无单点故障，高可用**
 
@@ -151,7 +185,7 @@ python download/node_resource_aware.py --model Qwen/Qwen2.5-0.5B-Instruct
 ./start.sh 3
 ```
 
-### 4. 中心化模式
+### 5. 中心化模式
 
 **特点：有Web管理界面**
 
@@ -161,6 +195,60 @@ python download/node_resource_aware.py --model Qwen/Qwen2.5-0.5B-Instruct
 ```bash
 ./start.sh 4
 ```
+
+---
+
+## 🏗️ 统一去中心化架构
+
+### 工作流程
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    启动流程                                   │
+├─────────────────────────────────────────────────────────────┤
+│  1. 节点启动，检查是否有其他节点存在                           │
+│  2. 如果没有其他节点 → 自动成为领导节点                        │
+│  3. 如果有其他节点 → 加入集群，参与选举                        │
+│  4. 领导节点负责：资源分配、API统一入口、任务调度               │
+│  5. 所有节点都可以参与推理计算                                 │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                    集群架构                                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│    ┌──────────────┐                                         │
+│    │   客户端请求   │                                         │
+│    └──────┬───────┘                                         │
+│           │                                                  │
+│           ▼                                                  │
+│    ┌──────────────┐      ┌──────────────┐                   │
+│    │   领导节点    │◄────►│   工作节点1   │                   │
+│    │  (Leader)    │      │  (Worker)    │                   │
+│    │  - API入口   │      │  - 模型推理   │                   │
+│    │  - 任务调度  │      │  - 资源上报   │                   │
+│    │  - 资源分配  │      └──────────────┘                   │
+│    └──────┬───────┘                                         │
+│           │                                                  │
+│           ▼                                                  │
+│    ┌──────────────┐      ┌──────────────┐                   │
+│    │   工作节点2   │◄────►│   工作节点3   │                   │
+│    │  (Worker)    │      │  (Worker)    │                   │
+│    └──────────────┘      └──────────────┘                   │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 核心组件
+
+| 组件 | 功能 |
+|------|------|
+| NetworkManager | TCP通信、消息编解码 |
+| NodeDiscovery | UDP广播发现、种子节点连接 |
+| RaftElection | Raft选举、心跳维护 |
+| ModelManager | 模型加载、推理执行 |
+| TaskScheduler | 任务队列、负载均衡 |
+| DistributedInferenceEngine | 分布式推理协调 |
 
 ---
 
@@ -185,7 +273,7 @@ network:
   port: 7000
 
 # 模式选择
-mode: "resource_aware"
+mode: "unified"  # unified, resource_aware, pipeline, decentralized
 ```
 
 ---
@@ -197,20 +285,20 @@ mode: "resource_aware"
 ### 健康检查
 
 ```bash
-curl http://localhost:7000/health
+curl http://localhost:8080/health
 # {"status": "healthy"}
 ```
 
 ### 查看状态
 
 ```bash
-curl http://localhost:7000/status
+curl http://localhost:8080/status
 ```
 
 ### 推理请求
 
 ```bash
-curl -X POST http://localhost:7000/inference \
+curl -X POST http://localhost:8080/inference \
   -H "Content-Type: application/json" \
   -d '{"prompt": "你好", "max_tokens": 50}'
 ```
@@ -221,10 +309,30 @@ curl -X POST http://localhost:7000/inference \
 import requests
 
 response = requests.post(
-    "http://localhost:7000/inference",
+    "http://localhost:8080/inference",
     json={"prompt": "你好", "max_tokens": 50}
 )
 print(response.json())
+```
+
+### 异步任务
+
+```python
+import requests
+import time
+
+# 提交任务
+response = requests.post(
+    "http://localhost:8080/task",
+    json={"prompt": "写一首诗", "params": {"max_tokens": 100}}
+)
+task_id = response.json()["task_id"]
+
+# 轮询结果
+while True:
+    status = requests.get(f"http://localhost:8080/status").json()
+    # 检查任务状态...
+    time.sleep(0.5)
 ```
 
 ---
@@ -262,6 +370,12 @@ launchctl load ~/Library/LaunchAgents/com.distributed.llm.plist
 ~/.distributed-llm/
 ├── sm/                    # 项目代码
 │   ├── download/          # 节点服务
+│   │   ├── node_unified.py           # 统一去中心化节点
+│   │   ├── distributed_inference.py  # 分布式推理模块
+│   │   ├── node_resource_aware.py    # 资源感知节点
+│   │   ├── node_pipeline_shard.py    # Pipeline分片节点
+│   │   ├── node_decentralized.py     # 去中心化节点
+│   │   └── node_service_production.py # 生产级节点
 │   └── ...
 ├── venv/                  # Python虚拟环境
 ├── config/                # 配置文件
@@ -327,6 +441,18 @@ export HF_ENDPOINT=https://hf-mirror.com
 python3 --version
 ```
 
+### 5. 领导节点选举失败
+
+```bash
+# 检查网络连接
+ping <其他节点IP>
+
+# 检查防火墙
+sudo ufw allow 5000/tcp  # 节点通信端口
+sudo ufw allow 9000/udp  # 发现端口
+sudo ufw allow 8080/tcp  # API端口
+```
+
 ---
 
 ## 📊 性能指标
@@ -336,6 +462,20 @@ python3 --version
 | Qwen2.5-0.5B | 1.8GB | 1.2s | 17 t/s |
 | Qwen2.5-1.5B | 3.5GB | 2.5s | 20 t/s |
 | Qwen2.5-7B | 14GB | 8s | 22 t/s |
+
+---
+
+## 🔄 版本更新
+
+### GLM分支更新
+
+本分支（glm）包含以下增强功能：
+
+1. **统一去中心化模式** - 整合所有模式为单一统一模式
+2. **自动节点发现** - UDP广播 + 种子节点双重发现机制
+3. **Raft选举完善** - 完整的领导者选举和心跳维护
+4. **联合分布式推理** - 支持模型分片和Pipeline并行
+5. **统一API入口** - 领导节点提供统一的REST API
 
 ---
 
