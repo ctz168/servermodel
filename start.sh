@@ -1,187 +1,225 @@
 #!/bin/bash
 #
-# 分布式大模型推理系统 - 一键启动脚本
+# 统一分布式推理系统 - 一键启动脚本
 #
-# 用法: ./start.sh [模式]
-#
-# 模式:
-#   1 或 resource_aware  - 资源感知模式（推荐）
-#   2 或 pipeline        - Pipeline并行模式
-#   3 或 decentralized   - 去中心化模式
-#   4 或 centralized     - 中心化模式
+# 使用方法:
+#   chmod +x start.sh && ./start.sh
 #
 
 set -e
 
-# 颜色
+# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
-# 默认配置
-MODEL="Qwen/Qwen2.5-0.5B-Instruct"
-PORT=7000
-MIN_MEMORY=2.0
-MIN_CPU=10.0
+# 打印带颜色的消息
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $1"
+}
 
-# 查找安装目录
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/download/node_resource_aware.py" ]; then
-    INSTALL_DIR="$SCRIPT_DIR"
-elif [ -f "$HOME/.distributed-llm/sm/download/node_resource_aware.py" ]; then
-    INSTALL_DIR="$HOME/.distributed-llm/sm"
-else
-    INSTALL_DIR="$SCRIPT_DIR"
-fi
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1"
+}
 
-# 激活虚拟环境
-if [ -f "$HOME/.distributed-llm/venv/bin/activate" ]; then
-    source "$HOME/.distributed-llm/venv/bin/activate"
-elif [ -f "$INSTALL_DIR/../venv/bin/activate" ]; then
-    source "$INSTALL_DIR/../venv/bin/activate"
-fi
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
 
-cd "$INSTALL_DIR"
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $1"
+}
 
-# 打印Banner
+# 打印横幅
 print_banner() {
-    echo -e "${CYAN}"
-    echo "╔══════════════════════════════════════════════════════════════════════╗"
-    echo "║                                                                      ║"
-    echo "║           分布式大模型推理系统 - 一键启动                            ║"
-    echo "║                                                                      ║"
-    echo "╚══════════════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    echo ""
+    echo -e "${GREEN}============================================================${NC}"
+    echo -e "${GREEN}   统一分布式推理系统 - 一键启动${NC}"
+    echo -e "${GREEN}============================================================${NC}"
+    echo ""
 }
 
-# 选择模式
-select_mode() {
-    echo -e "${CYAN}请选择启动模式:${NC}"
-    echo ""
-    echo "  1) 资源感知模式     - 自动检测资源，智能启停（推荐）"
-    echo "  2) Pipeline并行    - 多节点分片，内存最优"
-    echo "  3) 去中心化模式    - 无单点故障，高可用"
-    echo "  4) 中心化模式      - 有Web管理界面"
-    echo ""
-    echo -n "请输入选择 [1-4]: "
-    read -r choice
-    echo ""
+# 检查 Python
+check_python() {
+    print_info "检查 Python 环境..."
     
-    case $choice in
-        1) MODE="resource_aware" ;;
-        2) MODE="pipeline" ;;
-        3) MODE="decentralized" ;;
-        4) MODE="centralized" ;;
-        *) 
-            echo -e "${YELLOW}使用默认模式: 资源感知${NC}"
-            MODE="resource_aware"
-            ;;
-    esac
+    if command -v python3 &> /dev/null; then
+        PYTHON_CMD=python3
+    elif command -v python &> /dev/null; then
+        PYTHON_CMD=python
+    else
+        print_error "未找到 Python，请先安装 Python 3.8+"
+        print_info "安装方法: https://www.python.org/downloads/"
+        exit 1
+    fi
+    
+    PYTHON_VERSION=$($PYTHON_CMD --version 2>&1 | awk '{print $2}')
+    print_success "Python 版本: $PYTHON_VERSION"
 }
 
-# 启动资源感知模式
-start_resource_aware() {
-    echo -e "${BLUE}启动资源感知模式...${NC}"
+# 检查 pip
+check_pip() {
+    print_info "检查 pip..."
+    
+    if $PYTHON_CMD -m pip --version &> /dev/null; then
+        print_success "pip 已安装"
+    else
+        print_warning "pip 未安装，正在安装..."
+        $PYTHON_CMD -m ensurepip --upgrade
+    fi
+}
+
+# 安装依赖
+install_dependencies() {
+    print_info "检查依赖..."
+    
+    # 检查是否需要安装依赖
+    NEED_INSTALL=0
+    
+    # 检查 torch
+    if ! $PYTHON_CMD -c "import torch" 2>/dev/null; then
+        print_warning "torch 未安装"
+        NEED_INSTALL=1
+    fi
+    
+    # 检查 transformers
+    if ! $PYTHON_CMD -c "import transformers" 2>/dev/null; then
+        print_warning "transformers 未安装"
+        NEED_INSTALL=1
+    fi
+    
+    # 检查 psutil
+    if ! $PYTHON_CMD -c "import psutil" 2>/dev/null; then
+        print_warning "psutil 未安装"
+        NEED_INSTALL=1
+    fi
+    
+    if [ $NEED_INSTALL -eq 1 ]; then
+        print_info "正在安装依赖..."
+        
+        # 使用国内镜像加速
+        $PYTHON_CMD -m pip install --upgrade pip -q
+        $PYTHON_CMD -m pip install torch transformers psutil -q \
+            -i https://pypi.tuna.tsinghua.edu.cn/simple
+        
+        print_success "依赖安装完成"
+    else
+        print_success "所有依赖已安装"
+    fi
+}
+
+# 检查 GPU
+check_gpu() {
+    print_info "检查 GPU..."
+    
+    if $PYTHON_CMD -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+        GPU_NAME=$($PYTHON_CMD -c "import torch; print(torch.cuda.get_device_name(0))" 2>/dev/null)
+        GPU_MEMORY=$($PYTHON_CMD -c "import torch; print(torch.cuda.get_device_properties(0).total_memory / 1024**3)" 2>/dev/null)
+        print_success "检测到 GPU: $GPU_NAME (${GPU_MEMORY%.*}GB)"
+        DEVICE="cuda"
+    else
+        print_warning "未检测到 GPU，将使用 CPU 模式"
+        print_info "提示: CPU 模式速度较慢，建议使用 GPU"
+        DEVICE="cpu"
+    fi
+}
+
+# 选择模型
+select_model() {
+    print_info "选择模型..."
+    
+    # 根据设备选择合适的模型
+    if [ "$DEVICE" = "cuda" ]; then
+        # 有 GPU，根据显存选择模型
+        GPU_MEMORY=$($PYTHON_CMD -c "import torch; print(torch.cuda.get_device_properties(0).total_memory / 1024**3)" 2>/dev/null)
+        GPU_MEMORY_INT=${GPU_MEMORY%.*}
+        
+        if [ "$GPU_MEMORY_INT" -ge 20 ]; then
+            MODEL="Qwen/Qwen2.5-7B-Instruct"
+            print_success "选择模型: $MODEL (大模型，适合 ${GPU_MEMORY_INT}GB 显存)"
+        elif [ "$GPU_MEMORY_INT" -ge 10 ]; then
+            MODEL="Qwen/Qwen2.5-1.5B-Instruct"
+            print_success "选择模型: $MODEL (中等模型，适合 ${GPU_MEMORY_INT}GB 显存)"
+        else
+            MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+            print_success "选择模型: $MODEL (小模型，适合 ${GPU_MEMORY_INT}GB 显存)"
+        fi
+    else
+        # 无 GPU，使用小模型
+        MODEL="Qwen/Qwen2.5-0.5B-Instruct"
+        print_success "选择模型: $MODEL (小模型，适合 CPU)"
+    fi
+}
+
+# 设置环境变量
+setup_env() {
+    print_info "设置环境变量..."
+    
+    # 使用国内镜像加速模型下载
+    export HF_ENDPOINT=https://hf-mirror.com
+    
+    print_success "环境变量设置完成"
+}
+
+# 启动服务
+start_service() {
+    print_info "启动服务..."
+    
+    # 获取脚本所在目录
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    
+    # 主程序路径
+    MAIN_SCRIPT="$SCRIPT_DIR/download/node_unified_complete.py"
+    
+    # 检查主程序是否存在
+    if [ ! -f "$MAIN_SCRIPT" ]; then
+        print_error "主程序不存在: $MAIN_SCRIPT"
+        exit 1
+    fi
+    
+    # 设置端口
+    PORT=${PORT:-5000}
+    API_PORT=${API_PORT:-8080}
+    
     echo ""
-    echo -e "  模型: ${YELLOW}$MODEL${NC}"
-    echo -e "  端口: ${YELLOW}$PORT${NC}"
-    echo -e "  最小内存: ${YELLOW}${MIN_MEMORY}GB${NC}"
+    echo -e "${GREEN}============================================================${NC}"
+    echo -e "${GREEN}   服务启动中...${NC}"
+    echo -e "${GREEN}============================================================${NC}"
+    echo ""
+    echo -e "  模型:     ${YELLOW}$MODEL${NC}"
+    echo -e "  通信端口: ${YELLOW}$PORT${NC}"
+    echo -e "  API 端口: ${YELLOW}$API_PORT${NC}"
+    echo -e "  设备:     ${YELLOW}$DEVICE${NC}"
+    echo ""
+    echo -e "  API 地址: ${BLUE}http://localhost:$API_PORT${NC}"
+    echo -e "  健康检查: ${BLUE}http://localhost:$API_PORT/health${NC}"
+    echo ""
+    echo -e "${GREEN}============================================================${NC}"
+    echo -e "  按 ${YELLOW}Ctrl+C${NC} 停止服务"
+    echo -e "${GREEN}============================================================${NC}"
     echo ""
     
-    python3 download/node_resource_aware.py \
-        --model "$MODEL" \
+    # 启动主程序
+    $PYTHON_CMD "$MAIN_SCRIPT" \
         --port $PORT \
-        --min-memory $MIN_MEMORY \
-        --min-cpu $MIN_CPU
-}
-
-# 启动Pipeline模式
-start_pipeline() {
-    echo -e "${BLUE}启动Pipeline并行模式...${NC}"
-    echo ""
-    echo -n "请输入节点索引 [0]: "
-    read -r node_index
-    node_index=${node_index:-0}
-    
-    echo -n "请输入总节点数 [2]: "
-    read -r total_nodes
-    total_nodes=${total_nodes:-2}
-    
-    port=$((6000 + node_index))
-    
-    echo ""
-    echo -e "  节点索引: ${YELLOW}$node_index${NC}"
-    echo -e "  总节点数: ${YELLOW}$total_nodes${NC}"
-    echo -e "  端口: ${YELLOW}$port${NC}"
-    echo ""
-    
-    python3 download/node_pipeline_shard.py \
+        --api-port $API_PORT \
         --model "$MODEL" \
-        --index $node_index \
-        --total $total_nodes \
-        --port $port
-}
-
-# 启动去中心化模式
-start_decentralized() {
-    echo -e "${BLUE}启动去中心化模式...${NC}"
-    echo ""
-    echo -n "请输入端口 [5000]: "
-    read -r port
-    port=${port:-5000}
-    
-    echo ""
-    echo -e "  端口: ${YELLOW}$port${NC}"
-    echo ""
-    
-    python3 download/node_decentralized.py \
-        --model "$MODEL" \
-        --port $port
-}
-
-# 启动中心化模式
-start_centralized() {
-    echo -e "${BLUE}启动中心化模式...${NC}"
-    echo ""
-    echo -e "${YELLOW}注意: 需要先启动Orchestrator服务${NC}"
-    echo ""
-    
-    python3 download/node_service_optimized.py \
-        --model "$MODEL" \
-        --server http://localhost:3003
+        --auto
 }
 
 # 主函数
 main() {
     print_banner
-    
-    # 检查参数
-    if [ -n "$1" ]; then
-        case $1 in
-            1|resource_aware) MODE="resource_aware" ;;
-            2|pipeline) MODE="pipeline" ;;
-            3|decentralized) MODE="decentralized" ;;
-            4|centralized) MODE="centralized" ;;
-            *)
-                echo -e "${RED}未知模式: $1${NC}"
-                select_mode
-                ;;
-        esac
-    else
-        select_mode
-    fi
-    
-    # 启动对应模式
-    case $MODE in
-        resource_aware) start_resource_aware ;;
-        pipeline) start_pipeline ;;
-        decentralized) start_decentralized ;;
-        centralized) start_centralized ;;
-    esac
+    check_python
+    check_pip
+    install_dependencies
+    check_gpu
+    select_model
+    setup_env
+    start_service
 }
 
-# 运行
+# 运行主函数
 main "$@"

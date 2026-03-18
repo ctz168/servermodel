@@ -1,111 +1,150 @@
 @echo off
-REM 分布式大模型推理系统 - 一键启动脚本 (Windows)
-
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 
-:: 颜色
-for /F %%a in ('echo prompt $E^| cmd') do set "ESC=%%a"
-set "GREEN=!ESC![32m"
-set "YELLOW=!ESC![33m"
-set "BLUE=!ESC![34m"
-set "CYAN=!ESC![36m"
+REM 统一分布式推理系统 - 一键启动脚本 (Windows)
+REM 使用方法: 双击运行 start.bat
+
+REM 颜色定义（Windows 10+ 支持）
+for /f %%i in ('echo prompt $E^| cmd') do set "ESC=%%i"
+set "RED=!ESC![91m"
+set "GREEN=!ESC![92m"
+set "YELLOW=!ESC![93m"
+set "BLUE=!ESC![94m"
 set "NC=!ESC![0m"
 
-:: 默认配置
-set MODEL=Qwen/Qwen2.5-0.5B-Instruct
-set PORT=7000
-set MIN_MEMORY=2.0
-set MIN_CPU=10.0
+REM 打印横幅
+echo.
+echo ============================================================
+echo    统一分布式推理系统 - 一键启动
+echo ============================================================
+echo.
 
-:: 查找安装目录
-set SCRIPT_DIR=%~dp0
-if exist "%SCRIPT_DIR%download\node_resource_aware.py" (
-    set INSTALL_DIR=%SCRIPT_DIR%
-) else if exist "%USERPROFILE%\.distributed-llm\sm\download\node_resource_aware.py" (
-    set INSTALL_DIR=%USERPROFILE%\.distributed-llm\sm
+REM 检查 Python
+echo [信息] 检查 Python 环境...
+
+where python >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [错误] 未找到 Python，请先安装 Python 3.8+
+    echo [信息] 下载地址: https://www.python.org/downloads/
+    echo [信息] 安装时请勾选 "Add Python to PATH"
+    pause
+    exit /b 1
+)
+
+for /f "tokens=2" %%i in ('python --version 2^>^&1') do set PYTHON_VERSION=%%i
+echo [成功] Python 版本: %PYTHON_VERSION%
+
+REM 检查 pip
+echo [信息] 检查 pip...
+
+python -m pip --version >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [警告] pip 未安装，正在安装...
+    python -m ensurepip --upgrade
+)
+
+echo [成功] pip 已安装
+
+REM 检查依赖
+echo [信息] 检查依赖...
+
+set NEED_INSTALL=0
+
+python -c "import torch" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [警告] torch 未安装
+    set NEED_INSTALL=1
+)
+
+python -c "import transformers" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [警告] transformers 未安装
+    set NEED_INSTALL=1
+)
+
+python -c "import psutil" >nul 2>&1
+if %errorlevel% neq 0 (
+    echo [警告] psutil 未安装
+    set NEED_INSTALL=1
+)
+
+if %NEED_INSTALL% equ 1 (
+    echo [信息] 正在安装依赖...
+    python -m pip install --upgrade pip -q
+    python -m pip install torch transformers psutil -q -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo [成功] 依赖安装完成
 ) else (
-    set INSTALL_DIR=%SCRIPT_DIR%
+    echo [成功] 所有依赖已安装
 )
 
-:: 激活虚拟环境
-if exist "%USERPROFILE%\.distributed-llm\venv\Scripts\activate.bat" (
-    call "%USERPROFILE%\.distributed-llm\venv\Scripts\activate.bat"
+REM 检查 GPU
+echo [信息] 检查 GPU...
+
+python -c "import torch; assert torch.cuda.is_available()" >nul 2>&1
+if %errorlevel% equ 0 (
+    for /f "delims=" %%i in ('python -c "import torch; print(torch.cuda.get_device_name(0))"') do set GPU_NAME=%%i
+    for /f "delims=" %%i in ('python -c "import torch; print(int(torch.cuda.get_device_properties(0).total_memory / 1024**3))"') do set GPU_MEMORY=%%i
+    echo [成功] 检测到 GPU: !GPU_NAME! (!GPU_MEMORY!GB)
+    set DEVICE=cuda
+    
+    REM 根据显存选择模型
+    if !GPU_MEMORY! geq 20 (
+        set MODEL=Qwen/Qwen2.5-7B-Instruct
+    ) else if !GPU_MEMORY! geq 10 (
+        set MODEL=Qwen/Qwen2.5-1.5B-Instruct
+    ) else (
+        set MODEL=Qwen/Qwen2.5-0.5B-Instruct
+    )
+) else (
+    echo [警告] 未检测到 GPU，将使用 CPU 模式
+    echo [信息] 提示: CPU 模式速度较慢，建议使用 GPU
+    set DEVICE=cpu
+    set MODEL=Qwen/Qwen2.5-0.5B-Instruct
 )
 
-cd /d "%INSTALL_DIR%"
+echo [成功] 选择模型: %MODEL%
 
-:: 打印Banner
+REM 设置环境变量
+echo [信息] 设置环境变量...
+set HF_ENDPOINT=https://hf-mirror.com
+echo [成功] 环境变量设置完成
+
+REM 设置端口
+set PORT=5000
+set API_PORT=8080
+
+REM 获取脚本所在目录
+set SCRIPT_DIR=%~dp0
+set MAIN_SCRIPT=%SCRIPT_DIR%download\node_unified_complete.py
+
+REM 检查主程序是否存在
+if not exist "%MAIN_SCRIPT%" (
+    echo [错误] 主程序不存在: %MAIN_SCRIPT%
+    pause
+    exit /b 1
+)
+
 echo.
-echo !CYAN!╔══════════════════════════════════════════════════════════════════════╗!NC!
-echo !CYAN!║                                                                      ║!NC!
-echo !CYAN!║           分布式大模型推理系统 - 一键启动                            ║!NC!
-echo !CYAN!║                                                                      ║!NC!
-echo !CYAN!╚══════════════════════════════════════════════════════════════════════╝!NC!
+echo ============================================================
+echo    服务启动中...
+echo ============================================================
+echo.
+echo   模型:     %MODEL%
+echo   通信端口: %PORT%
+echo   API 端口: %API_PORT%
+echo   设备:     %DEVICE%
+echo.
+echo   API 地址: http://localhost:%API_PORT%
+echo   健康检查: http://localhost:%API_PORT%/health
+echo.
+echo ============================================================
+echo   按 Ctrl+C 停止服务
+echo ============================================================
 echo.
 
-:: 选择模式
-echo !CYAN!请选择启动模式:!NC!
-echo.
-echo   1) 资源感知模式     - 自动检测资源，智能启停（推荐）
-echo   2) Pipeline并行    - 多节点分片，内存最优
-echo   3) 去中心化模式    - 无单点故障，高可用
-echo   4) 中心化模式      - 有Web管理界面
-echo.
+REM 启动主程序
+python "%MAIN_SCRIPT%" --port %PORT% --api-port %API_PORT% --model "%MODEL%" --auto
 
-set /p choice="请输入选择 [1-4]: "
-
-if "%choice%"=="" set choice=1
-
-if "%choice%"=="1" goto resource_aware
-if "%choice%"=="2" goto pipeline
-if "%choice%"=="3" goto decentralized
-if "%choice%"=="4" goto centralized
-goto resource_aware
-
-:resource_aware
-echo.
-echo !BLUE!启动资源感知模式...!NC!
-echo.
-echo   模型: !YELLOW!%MODEL%!NC!
-echo   端口: !YELLOW!%PORT%!NC!
-echo.
-python download\node_resource_aware.py --model %MODEL% --port %PORT% --min-memory %MIN_MEMORY% --min-cpu %MIN_CPU%
-goto end
-
-:pipeline
-echo.
-echo !BLUE!启动Pipeline并行模式...!NC!
-set /p node_index="请输入节点索引 [0]: "
-if "%node_index%"=="" set node_index=0
-set /p total_nodes="请输入总节点数 [2]: "
-if "%total_nodes%"=="" set total_nodes=2
-set /a port=6000+%node_index%
-echo.
-echo   节点索引: !YELLOW!%node_index%!NC!
-echo   总节点数: !YELLOW!%total_nodes%!NC!
-echo   端口: !YELLOW!%port%!NC!
-echo.
-python download\node_pipeline_shard.py --model %MODEL% --index %node_index% --total %total_nodes% --port %port%
-goto end
-
-:decentralized
-echo.
-echo !BLUE!启动去中心化模式...!NC!
-set /p port="请输入端口 [5000]: "
-if "%port%"=="" set port=5000
-echo.
-echo   端口: !YELLOW!%port%!NC!
-echo.
-python download\node_decentralized.py --model %MODEL% --port %port%
-goto end
-
-:centralized
-echo.
-echo !BLUE!启动中心化模式...!NC!
-echo !YELLOW!注意: 需要先启动Orchestrator服务!NC!
-echo.
-python download\node_service_optimized.py --model %MODEL% --server http://localhost:3003
-goto end
-
-:end
+REM 如果程序退出，暂停以便查看错误信息
 pause
