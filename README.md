@@ -7,8 +7,11 @@
 - [快速开始](#-快速开始)
 - [一键安装](#-一键安装)
 - [使用方法](#-使用方法)
+- [Web UI](#-web-ui)
+- [Docker 部署](#-docker-部署)
 - [API 接口](#-api-接口)
 - [多节点集群](#-多节点集群)
+- [测试验证](#-测试验证)
 - [常见问题](#-常见问题)
 
 ---
@@ -112,6 +115,68 @@ python download/node_unified_complete.py --model "Qwen/Qwen2.5-7B-Instruct"
 
 ```bash
 python download/node_unified_complete.py --port 6000 --api-port 9000
+```
+
+---
+
+## 🖥️ Web UI
+
+启动服务后，打开浏览器访问：
+
+```
+http://localhost:8080
+```
+
+或使用独立的 Web UI 界面：
+
+```bash
+# 打开 UI 目录下的 index.html
+open ui/index.html        # Mac
+xdg-open ui/index.html    # Linux
+start ui/index.html       # Windows
+```
+
+**Web UI 功能：**
+- 💬 对话界面 - 直接与模型交互
+- 📊 状态监控 - 实时查看节点状态
+- 📡 API 文档 - 查看接口使用方法
+- ⚙️ 设置配置 - 自定义 API 地址
+
+---
+
+## 🐳 Docker 部署
+
+### 单节点部署
+
+```bash
+# 构建镜像
+docker build -t unified-inference .
+
+# 运行容器 (GPU)
+docker run -d -p 8080:8080 --gpus all unified-inference
+
+# 运行容器 (CPU)
+docker run -d -p 8080:8080 unified-inference
+```
+
+### 多节点集群部署
+
+```bash
+# 启动 3 节点集群
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f
+
+# 停止集群
+docker-compose down
+```
+
+### Docker Compose 配置
+
+```yaml
+# docker-compose.yml 已预配置 1 领导节点 + 2 工作节点
+# 可根据需要修改节点数量和资源配置
 ```
 
 ---
@@ -306,26 +371,96 @@ python download/node_unified_complete.py 2>&1 | tee server.log
 
 ---
 
+## 🧪 测试验证
+
+### 快速测试
+
+```bash
+# 运行测试脚本
+python test_api.py
+```
+
+### 手动测试
+
+```bash
+# 健康检查
+curl http://localhost:8080/health
+
+# 状态查看
+curl http://localhost:8080/status
+
+# 聊天测试
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-0.5B-Instruct", "messages": [{"role": "user", "content": "你好"}]}'
+```
+
+### 测试输出示例
+
+```
+============================================================
+  统一分布式推理系统 - API 测试
+============================================================
+
+API 地址: http://localhost:8080
+
+============================================================
+  测试 1: 健康检查
+============================================================
+✅ 服务状态: healthy
+✅ 健康分数: 85.5
+✅ 模型已加载: True
+
+============================================================
+  测试 4: 聊天补全
+============================================================
+发送请求: '你好，请介绍一下自己'
+✅ 响应: 我是通义千问，由阿里云开发的AI助手...
+✅ Token 数: 25
+✅ 延迟: 1.23s
+✅ 吞吐量: 20.3 tokens/s
+
+============================================================
+  测试结果汇总
+============================================================
+✅ 健康检查
+✅ 状态接口
+✅ 模型列表
+✅ 聊天补全
+✅ 文本补全
+
+通过: 5/5
+
+🎉 所有测试通过!
+```
+
+---
+
 ## 📁 项目结构
 
 ```
 servermodel-glm/
 ├── download/
 │   └── node_unified_complete.py   # 主程序（单文件，开箱即用）
+├── ui/
+│   └── index.html                 # Web UI 界面
 ├── scripts/
-│   ├── start.sh                   # Linux/Mac 启动脚本
-│   ├── start.bat                  # Windows 启动脚本
-│   ├── stop.sh                    # 停止脚本
-│   └── start_cluster.sh           # 集群启动脚本
+│   ├── start_cluster.sh           # 集群启动脚本
+│   └── stop_cluster.sh            # 集群停止脚本
 ├── docs/
 │   ├── STARTUP_FLOW.md            # 启动流程详解
 │   ├── MODE_UNIFICATION_PLAN.md   # 模式统一方案
 │   └── BUCKET_EFFECT_ANALYSIS.md  # 木桶效应分析
 ├── requirements.txt               # Python 依赖
+├── Dockerfile                     # Docker 镜像配置
+├── docker-compose.yml             # Docker Compose 配置
+├── test_api.py                    # API 测试脚本
 ├── install.sh                     # Linux/Mac 安装脚本
 ├── install.bat                    # Windows 安装脚本
 ├── start.sh                       # 一键启动（Linux/Mac）
 ├── start.bat                      # 一键启动（Windows）
+├── stop.sh                        # 停止服务（Linux/Mac）
+├── stop.bat                       # 停止服务（Windows）
 └── README.md                      # 本文档
 ```
 
