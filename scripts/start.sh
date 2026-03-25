@@ -171,7 +171,7 @@ start_service() {
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     
     # 主程序路径
-    MAIN_SCRIPT="$SCRIPT_DIR/download/node_unified_complete.py"
+    MAIN_SCRIPT="$SCRIPT_DIR/core/node_unified_complete.py"
     
     # 检查主程序是否存在
     if [ ! -f "$MAIN_SCRIPT" ]; then

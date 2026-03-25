@@ -27,7 +27,7 @@ BASE_API_PORT=8080
 # 获取脚本所在目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-MAIN_SCRIPT="$PROJECT_DIR/download/node_unified_complete.py"
+MAIN_SCRIPT="$PROJECT_DIR/core/node_unified_complete.py"
 
 echo ""
 echo -e "${GREEN}============================================================${NC}"

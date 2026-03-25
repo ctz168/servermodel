@@ -24,7 +24,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # 复制应用代码
-COPY download/node_unified_complete.py .
+COPY core/node_unified_complete.py .
 COPY ui/ ./ui/
 
 # 设置环境变量

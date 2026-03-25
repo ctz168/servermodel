@@ -39,7 +39,7 @@ chmod +x start.sh && ./start.sh
 pip install torch transformers psutil
 
 # 2. 启动服务
-python download/node_unified_complete.py
+python core/node_unified_complete.py
 
 # 3. 打开浏览器访问
 # http://localhost:8080
@@ -82,7 +82,7 @@ pip install -r requirements.txt
 ### 1. 最简单启动
 
 ```bash
-python download/node_unified_complete.py
+python core/node_unified_complete.py
 ```
 
 启动后访问：
@@ -93,7 +93,7 @@ python download/node_unified_complete.py
 ### 2. 自动模式选择
 
 ```bash
-python download/node_unified_complete.py --auto
+python core/node_unified_complete.py --auto
 ```
 
 系统会自动检测你的硬件配置，选择最佳运行模式。
@@ -102,19 +102,19 @@ python download/node_unified_complete.py --auto
 
 ```bash
 # 小模型（适合低配电脑）
-python download/node_unified_complete.py --model "Qwen/Qwen2.5-0.5B-Instruct"
+python core/node_unified_complete.py --model "Qwen/Qwen2.5-0.5B-Instruct"
 
 # 中等模型（适合 8GB+ 显存）
-python download/node_unified_complete.py --model "Qwen/Qwen2.5-1.5B-Instruct"
+python core/node_unified_complete.py --model "Qwen/Qwen2.5-1.5B-Instruct"
 
 # 大模型（适合 16GB+ 显存）
-python download/node_unified_complete.py --model "Qwen/Qwen2.5-7B-Instruct"
+python core/node_unified_complete.py --model "Qwen/Qwen2.5-7B-Instruct"
 ```
 
 ### 4. 指定端口
 
 ```bash
-python download/node_unified_complete.py --port 6000 --api-port 9000
+python core/node_unified_complete.py --port 6000 --api-port 9000
 ```
 
 ### 5. 使用配置文件
@@ -157,13 +157,13 @@ python download/node_unified_complete.py --port 6000 --api-port 9000
 **使用配置文件：**
 ```bash
 # 默认读取当前目录的 config.json
-python download/node_unified_complete.py
+python core/node_unified_complete.py
 
 # 指定配置文件路径
-python download/node_unified_complete.py --config /path/to/config.json
+python core/node_unified_complete.py --config /path/to/config.json
 
 # 命令行参数会覆盖配置文件
-python download/node_unified_complete.py --config config.json --port 6000
+python core/node_unified_complete.py --config config.json --port 6000
 ```
 
 **配置文件字段说明：**
@@ -198,14 +198,14 @@ pip install pyngrok
 **启动公网服务：**
 ```bash
 # 方式一：命令行指定 token
-python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+python core/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
 
 # 方式二：使用环境变量
 export NGROK_AUTHTOKEN=YOUR_TOKEN
-python download/node_unified_complete.py --ngrok
+python core/node_unified_complete.py --ngrok
 
 # 指定区域（默认 ap - 亚太）
-python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN --ngrok-region us
+python core/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN --ngrok-region us
 ```
 
 **启动后会显示：**
@@ -219,10 +219,10 @@ python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN -
 **多节点集群（公网）：**
 ```bash
 # 节点1（领导节点）
-python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+python core/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
 
 # 节点2（工作节点 - 在另一台机器上）
-python download/node_unified_complete.py --seeds "0.tcp.ngrok.io:12345" --ngrok --ngrok-auth-token YOUR_TOKEN
+python core/node_unified_complete.py --seeds "0.tcp.ngrok.io:12345" --ngrok --ngrok-auth-token YOUR_TOKEN
 ```
 
 **Ngrok 区域选项：**
@@ -369,17 +369,17 @@ print(response.choices[0].message.content)
 
 **节点 1（领导节点）：**
 ```bash
-python download/node_unified_complete.py --port 5000 --api-port 8080
+python core/node_unified_complete.py --port 5000 --api-port 8080
 ```
 
 **节点 2（工作节点）：**
 ```bash
-python download/node_unified_complete.py --port 5001 --api-port 8081 --seeds "localhost:5000"
+python core/node_unified_complete.py --port 5001 --api-port 8081 --seeds "localhost:5000"
 ```
 
 **节点 3（工作节点）：**
 ```bash
-python download/node_unified_complete.py --port 5002 --api-port 8082 --seeds "localhost:5000"
+python core/node_unified_complete.py --port 5002 --api-port 8082 --seeds "localhost:5000"
 ```
 
 ### 使用启动脚本
@@ -432,7 +432,7 @@ python download/node_unified_complete.py --port 5002 --api-port 8082 --seeds "lo
 **启动方式：**
 ```bash
 # 所有节点使用相同命令
-python download/node_unified_complete.py --mode data_parallel
+python core/node_unified_complete.py --mode data_parallel
 ```
 
 #### Pipeline 并行模式
@@ -457,10 +457,10 @@ python download/node_unified_complete.py --mode data_parallel
 **启动方式：**
 ```bash
 # 领导节点（阶段 0）
-python download/node_unified_complete.py --mode pipeline_parallel --stages 3
+python core/node_unified_complete.py --mode pipeline_parallel --stages 3
 
 # 工作节点（阶段 1, 2）
-python download/node_unified_complete.py --mode pipeline_parallel --stages 3 --seeds "leader:5000"
+python core/node_unified_complete.py --mode pipeline_parallel --stages 3 --seeds "leader:5000"
 ```
 
 **或通过配置文件：**
@@ -491,7 +491,7 @@ Pipeline 组 B: 节点4 → 节点5 → 节点6
 
 **启动方式：**
 ```bash
-python download/node_unified_complete.py --mode hybrid --dp 2 --pp 3
+python core/node_unified_complete.py --mode hybrid --dp 2 --pp 3
 ```
 
 ---
@@ -502,14 +502,14 @@ python download/node_unified_complete.py --mode hybrid --dp 2 --pp 3
 
 ```bash
 # 更换端口
-python download/node_unified_complete.py --port 6000 --api-port 9000
+python core/node_unified_complete.py --port 6000 --api-port 9000
 ```
 
 ### Q2: 内存不足怎么办？
 
 ```bash
 # 使用更小的模型
-python download/node_unified_complete.py --model "Qwen/Qwen2.5-0.5B-Instruct"
+python core/node_unified_complete.py --model "Qwen/Qwen2.5-0.5B-Instruct"
 
 # 或者使用 CPU 模式（自动降级）
 # 系统会自动检测并使用 CPU
@@ -520,7 +520,7 @@ python download/node_unified_complete.py --model "Qwen/Qwen2.5-0.5B-Instruct"
 ```bash
 # 使用国内镜像
 export HF_ENDPOINT=https://hf-mirror.com
-python download/node_unified_complete.py
+python core/node_unified_complete.py
 ```
 
 ### Q4: 如何查看日志？
@@ -528,7 +528,7 @@ python download/node_unified_complete.py
 ```bash
 # 启动时会自动打印日志到控制台
 # 也可以重定向到文件
-python download/node_unified_complete.py 2>&1 | tee server.log
+python core/node_unified_complete.py 2>&1 | tee server.log
 ```
 
 ### Q5: 如何停止服务？
@@ -536,7 +536,7 @@ python download/node_unified_complete.py 2>&1 | tee server.log
 ```bash
 # 按 Ctrl+C 停止
 # 或者使用停止脚本
-./stop.sh        # Linux/Mac
+./scripts/stop.sh        # Linux/Mac
 stop.bat         # Windows
 ```
 
@@ -551,7 +551,7 @@ pip install pyngrok
 ```bash
 # 确保使用正确的 authtoken
 # 访问 https://dashboard.ngrok.com/get-started/your-authtoken 获取
-python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+python core/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
 ```
 
 **错误：`Tunnel limit reached`**
@@ -566,12 +566,12 @@ taskkill /f /im ngrok.exe  # Windows
 
 ```bash
 # 1. 启动领导节点（带 ngrok）
-python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+python core/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
 
 # 2. 记录输出的节点通信地址，例如：tcp://0.tcp.ngrok.io:12345
 
 # 3. 在其他机器上启动工作节点
-python download/node_unified_complete.py --seeds "0.tcp.ngrok.io:12345" --ngrok --ngrok-auth-token YOUR_TOKEN
+python core/node_unified_complete.py --seeds "0.tcp.ngrok.io:12345" --ngrok --ngrok-auth-token YOUR_TOKEN
 ```
 
 ---
@@ -601,22 +601,22 @@ python download/node_unified_complete.py --seeds "0.tcp.ngrok.io:12345" --ngrok 
 
 ```
 servermodel/
-├── download/
+├── core/
 │   └── node_unified_complete.py   # 主程序（单文件，开箱即用）
 ├── ui/
 │   └── index.html                 # Web UI 界面
 ├── scripts/
+│   ├── install.sh                 # 安装脚本
+│   ├── start.sh                   # 启动脚本
+│   ├── stop.sh                    # 停止脚本
 │   ├── start_cluster.sh           # 集群启动脚本
 │   └── stop_cluster.sh            # 集群停止脚本
 ├── config.json                    # 配置文件（可选）
 ├── requirements.txt               # Python 依赖
 ├── Dockerfile                     # Docker 镜像配置
 ├── docker-compose.yml             # Docker Compose 配置
-├── install.sh                     # Linux/Mac 安装脚本
 ├── install.bat                    # Windows 安装脚本
-├── start.sh                       # 一键启动（Linux/Mac）
 ├── start.bat                      # 一键启动（Windows）
-├── stop.sh                        # 停止服务（Linux/Mac）
 ├── stop.bat                       # 停止服务（Windows）
 └── README.md                      # 本文档
 ```
