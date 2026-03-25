@@ -7,11 +7,11 @@
 - [快速开始](#-快速开始)
 - [一键安装](#-一键安装)
 - [使用方法](#-使用方法)
+- [公网暴露（Ngrok）](#-公网暴露ngrok)
 - [Web UI](#-web-ui)
 - [Docker 部署](#-docker-部署)
 - [API 接口](#-api-接口)
 - [多节点集群](#-多节点集群)
-- [测试验证](#-测试验证)
 - [常见问题](#-常见问题)
 
 ---
@@ -117,6 +117,123 @@ python download/node_unified_complete.py --model "Qwen/Qwen2.5-7B-Instruct"
 python download/node_unified_complete.py --port 6000 --api-port 9000
 ```
 
+### 5. 使用配置文件
+
+系统支持通过 `config.json` 配置文件进行配置，配置优先级：**命令行 > 配置文件 > 默认值**。
+
+**配置文件示例 (`config.json`)：**
+```json
+{
+  "node": {
+    "name": "my-node",
+    "host": "0.0.0.0",
+    "port": 5000,
+    "api_host": "0.0.0.0",
+    "api_port": 8080
+  },
+  "model": {
+    "name": "Qwen/Qwen2.5-0.5B-Instruct",
+    "cache_dir": "",
+    "device": "auto",
+    "precision": "auto",
+    "max_workers": 2
+  },
+  "ngrok": {
+    "enabled": true,
+    "auth_token": "YOUR_NGROK_TOKEN",
+    "region": "ap"
+  },
+  "paths": {
+    "model_cache": "",
+    "log_dir": "logs"
+  },
+  "cluster": {
+    "seeds": ["192.168.1.100:5000"],
+    "heartbeat_interval": 2.0
+  }
+}
+```
+
+**使用配置文件：**
+```bash
+# 默认读取当前目录的 config.json
+python download/node_unified_complete.py
+
+# 指定配置文件路径
+python download/node_unified_complete.py --config /path/to/config.json
+
+# 命令行参数会覆盖配置文件
+python download/node_unified_complete.py --config config.json --port 6000
+```
+
+**配置文件字段说明：**
+
+| 字段 | 说明 | 默认值 |
+|------|------|--------|
+| `node.name` | 节点名称 | 自动生成 |
+| `node.host` | 节点主机 | 0.0.0.0 |
+| `node.port` | 节点通信端口 | 5000 |
+| `node.api_port` | API 服务端口 | 8080 |
+| `model.name` | 模型名称 | Qwen/Qwen2.5-0.5B-Instruct |
+| `model.cache_dir` | 模型缓存目录 | ~/.cache/huggingface |
+| `ngrok.enabled` | 是否启用 ngrok | false |
+| `ngrok.auth_token` | ngrok 认证令牌 | - |
+| `ngrok.region` | ngrok 区域 | ap |
+| `paths.model_cache` | 模型缓存路径 | ~/.cache/huggingface |
+| `paths.log_dir` | 日志目录 | logs |
+
+### 6. 公网暴露（Ngrok）
+
+使用 ngrok 将服务暴露到公网，支持远程访问和多节点集群。
+
+**安装 ngrok：**
+```bash
+pip install pyngrok
+```
+
+**获取 authtoken：**
+1. 访问 https://dashboard.ngrok.com/get-started/your-authtoken
+2. 注册/登录后获取 authtoken
+
+**启动公网服务：**
+```bash
+# 方式一：命令行指定 token
+python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+
+# 方式二：使用环境变量
+export NGROK_AUTHTOKEN=YOUR_TOKEN
+python download/node_unified_complete.py --ngrok
+
+# 指定区域（默认 ap - 亚太）
+python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN --ngrok-region us
+```
+
+**启动后会显示：**
+```
+[Ngrok] 节点通信地址: tcp://0.tcp.ngrok.io:12345
+[Ngrok] API 公网地址: https://abc123.ngrok.io
+[Ngrok] 健康检查: https://abc123.ngrok.io/health
+[Ngrok] Web UI: https://abc123.ngrok.io
+```
+
+**多节点集群（公网）：**
+```bash
+# 节点1（领导节点）
+python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+
+# 节点2（工作节点 - 在另一台机器上）
+python download/node_unified_complete.py --seeds "0.tcp.ngrok.io:12345" --ngrok --ngrok-auth-token YOUR_TOKEN
+```
+
+**Ngrok 区域选项：**
+- `us` - 美国
+- `eu` - 欧洲
+- `ap` - 亚太（默认）
+- `au` - 澳大利亚
+- `sa` - 南美
+- `jp` - 日本
+- `in` - 印度
+
 ---
 
 ## 🖥️ Web UI
@@ -170,13 +287,6 @@ docker-compose logs -f
 
 # 停止集群
 docker-compose down
-```
-
-### Docker Compose 配置
-
-```yaml
-# docker-compose.yml 已预配置 1 领导节点 + 2 工作节点
-# 可根据需要修改节点数量和资源配置
 ```
 
 ---
@@ -277,6 +387,9 @@ python download/node_unified_complete.py --port 5002 --api-port 8082 --seeds "lo
 ```bash
 # 启动 3 节点集群
 ./scripts/start_cluster.sh 3
+
+# 停止集群
+./scripts/stop_cluster.sh
 ```
 
 ---
@@ -298,10 +411,88 @@ python download/node_unified_complete.py --port 5002 --api-port 8082 --seeds "lo
 
 | 模式 | 说明 | 适用场景 |
 |------|------|---------|
-| `data_parallel` | 数据并行 | 内存充足，追求低延迟 |
-| `pipeline_parallel` | Pipeline 并行 | 大模型，中等带宽 |
-| `tensor_parallel` | Tensor 并行 | 大模型，高带宽网络 |
-| `hybrid` | 混合并行 | 大规模集群 |
+| `data_parallel` | 数据并行（负载均衡） | 内存充足，追求低延迟，多请求高吞吐 |
+| `pipeline_parallel` | Pipeline 并行（模型分层） | 单节点显存不足，大模型，中等带宽 |
+| `tensor_parallel` | Tensor 并行（张量切分） | 大模型，高带宽网络（开发中） |
+| `hybrid` | 混合并行 | 大规模集群，最完整方案 |
+
+#### 数据并行模式（默认）
+
+**原理：** 每个节点加载完整模型，领导节点分发请求到空闲节点
+
+**优势：**
+- ✅ 实现简单，稳定可靠
+- ✅ 提高吞吐量（同时处理多个请求）
+- ✅ 故障恢复快（任何节点都能独立工作）
+
+**限制：**
+- ❌ 每个节点需要足够显存加载完整模型
+- ❌ 单个请求不能跨节点协作
+
+**启动方式：**
+```bash
+# 所有节点使用相同命令
+python download/node_unified_complete.py --mode data_parallel
+```
+
+#### Pipeline 并行模式
+
+**原理：** 模型按层切分到不同节点，请求依次流经各节点
+
+```
+节点A (0-12层)  →  节点B (13-24层)  →  节点C (25-36层)
+    ↑                    ↑                    ↑
+  输入               中间结果              输出
+```
+
+**优势：**
+- ✅ 可以运行比单个节点显存更大的模型
+- ✅ 单个请求由多节点协作完成
+- ✅ 降低单节点显存需求
+
+**限制：**
+- ❌ 增加通信延迟
+- ❌ 需要稳定网络连接
+
+**启动方式：**
+```bash
+# 领导节点（阶段 0）
+python download/node_unified_complete.py --mode pipeline_parallel --stages 3
+
+# 工作节点（阶段 1, 2）
+python download/node_unified_complete.py --mode pipeline_parallel --stages 3 --seeds "leader:5000"
+```
+
+**或通过配置文件：**
+```json
+{
+  "parallel": {
+    "mode": "pipeline_parallel",
+    "pipeline_stages": 3
+  }
+}
+```
+
+#### 混合并行模式
+
+**原理：** Pipeline 并行 + 数据并行
+
+```
+Pipeline 组 A: 节点1 → 节点2 → 节点3
+Pipeline 组 B: 节点4 → 节点5 → 节点6
+```
+
+- 每个 Pipeline 组可以处理不同的请求（数据并行）
+- 单个请求在一个 Pipeline 组内协作完成（Pipeline 并行）
+
+**优势：**
+- ✅ 兼具高吞吐量和大模型支持
+- ✅ 最完整的分布式方案
+
+**启动方式：**
+```bash
+python download/node_unified_complete.py --mode hybrid --dp 2 --pp 3
+```
 
 ---
 
@@ -345,7 +536,42 @@ python download/node_unified_complete.py 2>&1 | tee server.log
 ```bash
 # 按 Ctrl+C 停止
 # 或者使用停止脚本
-./scripts/stop.sh
+./stop.sh        # Linux/Mac
+stop.bat         # Windows
+```
+
+### Q6: Ngrok 报错怎么办？
+
+**错误：`pyngrok 未安装`**
+```bash
+pip install pyngrok
+```
+
+**错误：`Authentication failed`**
+```bash
+# 确保使用正确的 authtoken
+# 访问 https://dashboard.ngrok.com/get-started/your-authtoken 获取
+python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+```
+
+**错误：`Tunnel limit reached`**
+```
+# 免费账户同时只能运行 1 个隧道
+# 需要关闭其他 ngrok 进程
+pkill ngrok  # Linux/Mac
+taskkill /f /im ngrok.exe  # Windows
+```
+
+### Q7: 如何在公网运行多节点集群？
+
+```bash
+# 1. 启动领导节点（带 ngrok）
+python download/node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN
+
+# 2. 记录输出的节点通信地址，例如：tcp://0.tcp.ngrok.io:12345
+
+# 3. 在其他机器上启动工作节点
+python download/node_unified_complete.py --seeds "0.tcp.ngrok.io:12345" --ngrok --ngrok-auth-token YOUR_TOKEN
 ```
 
 ---
@@ -371,75 +597,10 @@ python download/node_unified_complete.py 2>&1 | tee server.log
 
 ---
 
-## 🧪 测试验证
-
-### 快速测试
-
-```bash
-# 运行测试脚本
-python test_api.py
-```
-
-### 手动测试
-
-```bash
-# 健康检查
-curl http://localhost:8080/health
-
-# 状态查看
-curl http://localhost:8080/status
-
-# 聊天测试
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model": "Qwen/Qwen2.5-0.5B-Instruct", "messages": [{"role": "user", "content": "你好"}]}'
-```
-
-### 测试输出示例
-
-```
-============================================================
-  统一分布式推理系统 - API 测试
-============================================================
-
-API 地址: http://localhost:8080
-
-============================================================
-  测试 1: 健康检查
-============================================================
-✅ 服务状态: healthy
-✅ 健康分数: 85.5
-✅ 模型已加载: True
-
-============================================================
-  测试 4: 聊天补全
-============================================================
-发送请求: '你好，请介绍一下自己'
-✅ 响应: 我是通义千问，由阿里云开发的AI助手...
-✅ Token 数: 25
-✅ 延迟: 1.23s
-✅ 吞吐量: 20.3 tokens/s
-
-============================================================
-  测试结果汇总
-============================================================
-✅ 健康检查
-✅ 状态接口
-✅ 模型列表
-✅ 聊天补全
-✅ 文本补全
-
-通过: 5/5
-
-🎉 所有测试通过!
-```
-
----
-
 ## 📁 项目结构
 
 ```
-servermodel-glm/
+servermodel/
 ├── download/
 │   └── node_unified_complete.py   # 主程序（单文件，开箱即用）
 ├── ui/
@@ -447,14 +608,10 @@ servermodel-glm/
 ├── scripts/
 │   ├── start_cluster.sh           # 集群启动脚本
 │   └── stop_cluster.sh            # 集群停止脚本
-├── docs/
-│   ├── STARTUP_FLOW.md            # 启动流程详解
-│   ├── MODE_UNIFICATION_PLAN.md   # 模式统一方案
-│   └── BUCKET_EFFECT_ANALYSIS.md  # 木桶效应分析
+├── config.json                    # 配置文件（可选）
 ├── requirements.txt               # Python 依赖
 ├── Dockerfile                     # Docker 镜像配置
 ├── docker-compose.yml             # Docker Compose 配置
-├── test_api.py                    # API 测试脚本
 ├── install.sh                     # Linux/Mac 安装脚本
 ├── install.bat                    # Windows 安装脚本
 ├── start.sh                       # 一键启动（Linux/Mac）

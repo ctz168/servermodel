@@ -64,6 +64,12 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+try:
+    from pyngrok import ngrok
+    HAS_NGROK = True
+except ImportError:
+    HAS_NGROK = False
+
 
 # ==================== 版本信息 ====================
 
@@ -626,7 +632,7 @@ class LoadBalancer:
                 print(f"[负载均衡] ⚠️ 发现慢节点: {node_id[:8]} (延迟: {stats['avg_latency']:.3f}s)")
         elif node_id in self.straggler_nodes:
             self.straggler_nodes.discard(node_id)
-            print(f"[负载均衡] ✅ 节点恢复: {node_id[:8]}")
+            print(f"[负载均衡] [OK] 节点恢复: {node_id[:8]}")
     
     def select_node(self, nodes: Dict[str, NodeInfo], 
                     exclude: Set[str] = None) -> Optional[str]:
@@ -680,6 +686,269 @@ class LoadBalancer:
                     for nid, stats in self.node_stats.items()
                 },
                 "straggler_nodes": list(self.straggler_nodes),
+            }
+
+
+# ==================== 分布式推理协调器 ====================
+
+class DistributedInferenceCoordinator:
+    """分布式推理协调器 - 管理 Pipeline 并行推理"""
+    
+    def __init__(self, node: 'UnifiedNode'):
+        self.node = node
+        self.pipeline_groups: Dict[str, List[str]] = {}  # pipeline_id -> [node_id, ...]
+        self.stage_assignments: Dict[str, int] = {}  # node_id -> stage_id
+        self.pending_stages: Dict[str, Dict[int, Any]] = {}  # task_id -> {stage_id: hidden_states}
+        self.lock = threading.Lock()
+        
+        # 统计
+        self.total_pipeline_inferences = 0
+        self.total_pipeline_latency = 0.0
+    
+    def setup_pipeline(self, pipeline_id: str, nodes: List[str], total_stages: int):
+        """
+        设置 Pipeline 组
+        
+        Args:
+            pipeline_id: Pipeline 组ID
+            nodes: 参与的节点列表
+            total_stages: 总阶段数
+        """
+        with self.lock:
+            self.pipeline_groups[pipeline_id] = nodes
+            
+            # 分配阶段
+            for i, node_id in enumerate(nodes):
+                self.stage_assignments[node_id] = i
+            
+            print(f"[Pipeline] 创建 Pipeline 组 {pipeline_id[:8]}: {len(nodes)} 个节点, {total_stages} 个阶段")
+    
+    def get_stage_for_node(self, node_id: str) -> int:
+        """获取节点所属的阶段"""
+        return self.stage_assignments.get(node_id, -1)
+    
+    def start_pipeline_inference(self, task_id: str, prompt: str, 
+                                  pipeline_id: str, max_tokens: int = 256) -> Dict:
+        """
+        启动 Pipeline 推理
+        
+        Args:
+            task_id: 任务ID
+            prompt: 输入提示
+            pipeline_id: Pipeline 组ID
+            max_tokens: 最大生成token数
+            
+        Returns:
+            推理结果或中间状态
+        """
+        start_time = time.time()
+        
+        try:
+            # 获取 Pipeline 组的节点
+            nodes = self.pipeline_groups.get(pipeline_id, [])
+            if not nodes:
+                return {"success": False, "error": "Pipeline 组不存在"}
+            
+            # 第一阶段节点
+            first_node_id = nodes[0]
+            
+            # 初始化任务状态
+            with self.lock:
+                self.pending_stages[task_id] = {
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "current_stage": 0,
+                    "start_time": start_time,
+                    "hidden_states": None,
+                }
+            
+            # 发送到第一阶段节点
+            if first_node_id == self.node.node_info.node_id:
+                # 本地执行第一阶段
+                return self._execute_first_stage(task_id, prompt)
+            else:
+                # 远程执行第一阶段
+                return self._send_to_node(first_node_id, {
+                    "type": "pipeline_stage",
+                    "task_id": task_id,
+                    "stage": 0,
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                })
+            
+        except Exception as e:
+            print(f"[Pipeline] 启动推理失败: {e}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+    
+    def _execute_first_stage(self, task_id: str, prompt: str) -> Dict:
+        """执行第一阶段推理"""
+        try:
+            # Tokenize
+            inputs = self.node.model_manager.tokenizer(prompt, return_tensors="pt")
+            if self.node.model_manager.device != "cpu":
+                inputs = {k: v.to(self.node.model_manager.device) for k, v in inputs.items()}
+            
+            # 获取隐藏状态
+            with torch.no_grad():
+                # 执行 embedding
+                hidden_states = inputs["input_ids"]
+                
+                # 获取下一节点
+                nodes = self.pipeline_groups.get("default", [])
+                if len(nodes) > 1:
+                    next_node_id = nodes[1]
+                    
+                    # 序列化隐藏状态
+                    hidden_numpy = hidden_states.cpu().numpy()
+                    hidden_bytes = pickle.dumps(hidden_numpy)
+                    hidden_compressed = zlib.compress(hidden_bytes)
+                    
+                    # 发送到下一阶段
+                    return self._send_to_node(next_node_id, {
+                        "type": "pipeline_stage",
+                        "task_id": task_id,
+                        "stage": 1,
+                        "hidden_states": hidden_compressed,
+                        "attention_mask": None,
+                    })
+                else:
+                    # 单节点，直接完成推理
+                    result = self.node.model_manager.inference(
+                        prompt, 
+                        max_tokens=self.pending_stages[task_id]["max_tokens"]
+                    )
+                    
+                    # 清理
+                    with self.lock:
+                        del self.pending_stages[task_id]
+                    
+                    return {
+                        "success": True,
+                        "response": result.response,
+                        "tokens": result.tokens,
+                        "latency": time.time() - self.pending_stages.get(task_id, {}).get("start_time", time.time()),
+                    }
+                    
+        except Exception as e:
+            print(f"[Pipeline] 第一阶段执行失败: {e}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+    
+    def handle_stage_result(self, task_id: str, stage: int, 
+                           hidden_states: bytes, attention_mask: bytes = None):
+        """
+        处理阶段结果
+        
+        Args:
+            task_id: 任务ID
+            stage: 当前阶段
+            hidden_states: 隐藏状态（压缩后）
+            attention_mask: 注意力掩码（压缩后）
+        """
+        try:
+            # 解压隐藏状态
+            hidden_bytes = zlib.decompress(hidden_states)
+            hidden_numpy = pickle.loads(hidden_bytes)
+            hidden_tensor = torch.from_numpy(hidden_numpy)
+            
+            if self.node.model_manager.device != "cpu":
+                hidden_tensor = hidden_tensor.to(self.node.model_manager.device)
+            
+            # 获取任务信息
+            with self.lock:
+                task_info = self.pending_stages.get(task_id)
+                if not task_info:
+                    return {"success": False, "error": "任务不存在"}
+            
+            # 获取下一阶段
+            nodes = self.pipeline_groups.get("default", [])
+            next_stage = stage + 1
+            
+            if next_stage >= len(nodes):
+                # 最后阶段，生成结果
+                return self._generate_final_output(task_id, hidden_tensor)
+            else:
+                # 发送到下一阶段
+                next_node_id = nodes[next_stage]
+                
+                # 序列化
+                hidden_numpy = hidden_tensor.cpu().numpy()
+                hidden_bytes = pickle.dumps(hidden_numpy)
+                hidden_compressed = zlib.compress(hidden_bytes)
+                
+                return self._send_to_node(next_node_id, {
+                    "type": "pipeline_stage",
+                    "task_id": task_id,
+                    "stage": next_stage,
+                    "hidden_states": hidden_compressed,
+                    "attention_mask": attention_mask,
+                })
+                
+        except Exception as e:
+            print(f"[Pipeline] 处理阶段结果失败: {e}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+    
+    def _generate_final_output(self, task_id: str, hidden_states: torch.Tensor) -> Dict:
+        """生成最终输出"""
+        try:
+            # 通过 lm_head
+            with torch.no_grad():
+                if hasattr(self.node.model_manager.model, 'lm_head'):
+                    logits = self.node.model_manager.model.lm_head(hidden_states)
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1)
+                    
+                    # 解码
+                    response = self.node.model_manager.tokenizer.decode(
+                        next_token, 
+                        skip_special_tokens=True
+                    )
+                else:
+                    response = ""
+            
+            # 获取延迟
+            with self.lock:
+                task_info = self.pending_stages.get(task_id, {})
+                latency = time.time() - task_info.get("start_time", time.time())
+                
+                # 清理
+                if task_id in self.pending_stages:
+                    del self.pending_stages[task_id]
+                
+                # 更新统计
+                self.total_pipeline_inferences += 1
+                self.total_pipeline_latency += latency
+            
+            return {
+                "success": True,
+                "response": response,
+                "tokens": 1,  # Pipeline 单步生成
+                "latency": latency,
+            }
+            
+        except Exception as e:
+            print(f"[Pipeline] 生成输出失败: {e}")
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+    
+    def _send_to_node(self, node_id: str, message: Dict) -> Dict:
+        """发送消息到节点"""
+        try:
+            # 使用网络管理器发送
+            return self.node.network.send_message(node_id, message)
+        except Exception as e:
+            print(f"[Pipeline] 发送消息失败: {e}")
+            return {"success": False, "error": str(e)}
+    
+    def get_stats(self) -> Dict:
+        """获取统计信息"""
+        with self.lock:
+            return {
+                "pipeline_groups": len(self.pipeline_groups),
+                "pending_tasks": len(self.pending_stages),
+                "total_inferences": self.total_pipeline_inferences,
+                "avg_latency": self.total_pipeline_latency / max(1, self.total_pipeline_inferences),
             }
 
 
@@ -1140,7 +1409,7 @@ class ModelManager:
             self.loaded = True
             self.load_time = time.time() - start_time
             
-            print(f"[模型] ✅ 加载完成!")
+            print(f"[模型] [OK] 加载完成!")
             print(f"   参数量: {param_count/1e9:.2f}B")
             print(f"   大小: {self.model_size_gb:.2f}GB")
             print(f"   设备: {self.device}")
@@ -1149,7 +1418,7 @@ class ModelManager:
             return True
             
         except Exception as e:
-            print(f"[模型] ❌ 加载失败: {e}")
+            print(f"[模型] [ERROR] 加载失败: {e}")
             traceback.print_exc()
             return False
     
@@ -1232,6 +1501,208 @@ class ModelManager:
             "avg_latency": self.total_latency / max(1, self.total_inferences),
             "avg_throughput": self.total_tokens / max(0.001, self.total_latency),
         }
+    
+    def get_layer_count(self) -> int:
+        """获取模型层数"""
+        if not self.loaded or self.model is None:
+            return 0
+        
+        try:
+            # 获取 transformer 层数
+            if hasattr(self.model, 'config'):
+                if hasattr(self.model.config, 'num_hidden_layers'):
+                    return self.model.config.num_hidden_layers
+                elif hasattr(self.model.config, 'n_layer'):
+                    return self.model.config.n_layer
+                elif hasattr(self.model.config, 'num_layers'):
+                    return self.model.config.num_layers
+            
+            # 尝试从模型结构推断
+            if hasattr(self.model, 'model'):
+                if hasattr(self.model.model, 'layers'):
+                    return len(self.model.model.layers)
+                elif hasattr(self.model.model, 'h'):
+                    return len(self.model.model.h)
+            
+            return 0
+        except:
+            return 0
+    
+    def load_shard(self, stage_id: int, total_stages: int) -> bool:
+        """
+        加载模型分片（Pipeline 并行）
+        
+        Args:
+            stage_id: 当前阶段ID (0-based)
+            total_stages: 总阶段数
+            
+        Returns:
+            是否加载成功
+        """
+        if not HAS_TORCH:
+            print("[模型] PyTorch未安装，无法加载模型分片")
+            return False
+        
+        start_time = time.time()
+        
+        try:
+            print(f"[模型] 加载模型分片: 阶段 {stage_id+1}/{total_stages}")
+            
+            # 加载完整模型配置
+            config = AutoConfig.from_pretrained(
+                self.config.model_name,
+                trust_remote_code=True
+            )
+            
+            # 获取总层数
+            total_layers = self.get_layer_count()
+            if total_layers == 0:
+                print("[模型] 无法获取模型层数，回退到完整模型加载")
+                return self.load()
+            
+            # 计算每个阶段的层数
+            layers_per_stage = total_layers // total_stages
+            remainder = total_layers % total_stages
+            
+            # 计算当前阶段的层范围
+            layer_start = stage_id * layers_per_stage + min(stage_id, remainder)
+            if stage_id < remainder:
+                layer_end = layer_start + layers_per_stage + 1
+            else:
+                layer_end = layer_start + layers_per_stage
+            
+            # 最后一阶段包含所有剩余层
+            if stage_id == total_stages - 1:
+                layer_end = total_layers
+            
+            print(f"   层范围: {layer_start}-{layer_end-1} (共 {layer_end - layer_start} 层)")
+            
+            # 加载 tokenizer
+            print("   [1/2] 加载Tokenizer...")
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.config.model_name,
+                trust_remote_code=True
+            )
+            
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            # 加载完整模型（暂时，实际应用中应该只加载分片）
+            # 注意：真正的分片加载需要更复杂的实现，这里先加载完整模型
+            # 然后只使用指定层
+            print("   [2/2] 加载模型分片...")
+            
+            if torch.cuda.is_available():
+                self.device = "cuda"
+                torch_dtype = torch.float16
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.device = "mps"
+                torch_dtype = torch.float16
+            else:
+                self.device = "cpu"
+                torch_dtype = torch.float32
+            
+            # 加载完整模型
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_name,
+                torch_dtype=torch_dtype,
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
+            
+            if self.device != "cpu":
+                self.model = self.model.to(self.device)
+            
+            self.model.eval()
+            
+            # 保存分片信息
+            self.pipeline_stage = stage_id
+            self.shard_layers = list(range(layer_start, layer_end))
+            self.shard_id = stage_id
+            
+            param_count = sum(p.numel() for p in self.model.parameters())
+            self.model_size_gb = param_count * 4 / (1024**3)
+            
+            self.loaded = True
+            self.load_time = time.time() - start_time
+            
+            # 标记是否为第一/最后阶段
+            is_first = (stage_id == 0)
+            is_last = (stage_id == total_stages - 1)
+            
+            print(f"[模型] [OK] 分片加载完成!")
+            print(f"   阶段: {stage_id+1}/{total_stages}")
+            print(f"   层: {layer_start}-{layer_end-1}")
+            print(f"   类型: {'第一阶段' if is_first else '最后阶段' if is_last else '中间阶段'}")
+            print(f"   设备: {self.device}")
+            print(f"   时间: {self.load_time:.1f}s")
+            
+            return True
+            
+        except Exception as e:
+            print(f"[模型] [ERROR] 分片加载失败: {e}")
+            traceback.print_exc()
+            return False
+    
+    def forward_stage(self, hidden_states: Any, attention_mask: Any = None) -> Any:
+        """
+        执行当前阶段的前向传播
+        
+        Args:
+            hidden_states: 输入隐藏状态
+            attention_mask: 注意力掩码
+            
+        Returns:
+            输出隐藏状态
+        """
+        if not self.loaded or self.model is None:
+            raise ValueError("模型未加载")
+        
+        try:
+            # 获取模型的 transformer 部分
+            if hasattr(self.model, 'model'):
+                transformer = self.model.model
+            elif hasattr(self.model, 'transformer'):
+                transformer = self.model.transformer
+            else:
+                transformer = self.model
+            
+            # 执行指定层的前向传播
+            with torch.no_grad():
+                # 如果有 embedding 层且是第一阶段，需要先嵌入
+                if self.pipeline_stage == 0:
+                    if hasattr(transformer, 'embed_tokens'):
+                        hidden_states = transformer.embed_tokens(hidden_states)
+                    elif hasattr(transformer, 'wte'):
+                        hidden_states = transformer.wte(hidden_states)
+                
+                # 执行当前阶段的层
+                if hasattr(transformer, 'layers'):
+                    layers = transformer.layers
+                elif hasattr(transformer, 'h'):
+                    layers = transformer.h
+                else:
+                    layers = []
+                
+                for layer_idx in self.shard_layers:
+                    if layer_idx < len(layers):
+                        layer = layers[layer_idx]
+                        if attention_mask is not None:
+                            hidden_states = layer(hidden_states, attention_mask=attention_mask)
+                        else:
+                            hidden_states = layer(hidden_states)
+                
+                # 如果是最后阶段，需要经过 lm_head
+                if self.pipeline_stage >= 0:  # 简化判断
+                    if hasattr(self.model, 'lm_head'):
+                        hidden_states = self.model.lm_head(hidden_states)
+            
+            return hidden_states
+            
+        except Exception as e:
+            print(f"[Pipeline] 前向传播错误: {e}")
+            traceback.print_exc()
+            raise
 
 
 # ==================== API 服务器 ====================
@@ -1550,6 +2021,7 @@ class UnifiedNode:
             config.load_balance_strategy,
             config.straggler_threshold
         )
+        self.pipeline_coordinator = DistributedInferenceCoordinator(self)
         
         # 节点信息
         self.node_info = NodeInfo(
@@ -1567,6 +2039,8 @@ class UnifiedNode:
         
         # Pipeline
         self.pipeline_stages: List[PipelineStage] = []
+        self.pipeline_enabled = False
+        self.pipeline_stage_id = -1
         
         # 状态
         self.running = False
@@ -1594,9 +2068,43 @@ class UnifiedNode:
         self._register_handlers()
         
         # 加载模型
-        if not self.model_manager.load():
-            print("[错误] 模型加载失败")
-            return
+        if self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL:
+            # Pipeline 并行模式 - 加载模型分片
+            total_stages = self.config.pipeline_stages
+            if total_stages <= 1:
+                print("[警告] Pipeline 阶段数无效，使用默认值 2")
+                total_stages = 2
+            
+            # 确定当前节点的阶段ID
+            # 领导节点为阶段 0，其他节点按加入顺序分配
+            if self.election.state == NodeRole.LEADER:
+                stage_id = 0
+            else:
+                # 工作节点根据配置或自动分配阶段
+                stage_id = len(self.network.peers) % total_stages
+            
+            print(f"\n[Pipeline] 加载模型分片...")
+            print(f"[Pipeline] 阶段: {stage_id + 1}/{total_stages}")
+            
+            if not self.model_manager.load_shard(stage_id, total_stages):
+                print("[错误] 模型分片加载失败")
+                return
+            
+            self.pipeline_enabled = True
+            self.pipeline_stage_id = stage_id
+            
+        elif self.config.parallel_mode == ParallelMode.HYBRID:
+            # 混合并行模式
+            # TODO: 实现混合并行
+            print("[警告] 混合并行模式尚未完全实现，使用数据并行")
+            if not self.model_manager.load():
+                print("[错误] 模型加载失败")
+                return
+        else:
+            # 数据并行模式 - 加载完整模型
+            if not self.model_manager.load():
+                print("[错误] 模型加载失败")
+                return
         
         self.node_info.model_loaded = True
         self.node_info.model_name = self.config.model_name
@@ -1609,7 +2117,7 @@ class UnifiedNode:
         threading.Thread(target=self._task_loop, daemon=True).start()
         
         print("\n" + "=" * 60)
-        print("[系统] ✅ 节点启动完成!")
+        print("[系统] [OK] 节点启动完成!")
         print(f"[API] http://{self.config.api_host}:{self.config.api_port}")
         print("=" * 60)
         print("\n按 Ctrl+C 停止...\n")
@@ -1805,12 +2313,113 @@ class UnifiedNode:
 
 # ==================== 主函数 ====================
 
+def load_config_file(config_path: str) -> Dict:
+    """加载配置文件"""
+    if not os.path.exists(config_path):
+        return {}
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        print(f"[配置] 已加载配置文件: {config_path}")
+        return config
+    except Exception as e:
+        print(f"[配置] 加载配置文件失败: {e}")
+        return {}
+
+
+def merge_config(args, file_config: Dict) -> UnifiedConfig:
+    """合并配置：命令行 > 配置文件 > 默认值"""
+    
+    # 从配置文件获取值
+    node_cfg = file_config.get('node', {})
+    model_cfg = file_config.get('model', {})
+    cluster_cfg = file_config.get('cluster', {})
+    parallel_cfg = file_config.get('parallel', {})
+    lb_cfg = file_config.get('load_balance', {})
+    ngrok_cfg = file_config.get('ngrok', {})
+    paths_cfg = file_config.get('paths', {})
+    logging_cfg = file_config.get('logging', {})
+    health_cfg = file_config.get('health', {})
+    
+    # 合并配置（命令行优先）
+    config = UnifiedConfig(
+        # 节点配置
+        host=args.host if args.host else node_cfg.get('host', '0.0.0.0'),
+        port=args.port if args.port != 5000 else node_cfg.get('port', 5000),
+        api_host=args.api_host if args.api_host else node_cfg.get('api_host', '0.0.0.0'),
+        api_port=args.api_port if args.api_port != 8080 else node_cfg.get('api_port', 8080),
+        node_name=node_cfg.get('name', ''),
+        
+        # 模型配置
+        model_name=args.model if args.model != "Qwen/Qwen2.5-0.5B-Instruct" else model_cfg.get('name', "Qwen/Qwen2.5-0.5B-Instruct"),
+        model_memory_gb=model_cfg.get('memory_gb', 2.0),
+        max_workers=model_cfg.get('max_workers', 2),
+        
+        # 集群配置
+        seeds=args.seeds.split(",") if args.seeds else cluster_cfg.get('seeds', []),
+        discovery_port=cluster_cfg.get('discovery_port', 9000),
+        heartbeat_interval=cluster_cfg.get('heartbeat_interval', 2.0),
+        election_timeout_min=cluster_cfg.get('election_timeout_min', 3.0),
+        election_timeout_max=cluster_cfg.get('election_timeout_max', 6.0),
+        leader_timeout=cluster_cfg.get('leader_timeout', 10.0),
+        node_timeout=cluster_cfg.get('node_timeout', 30.0),
+        
+        # 并行配置
+        parallel_mode=args.mode if args.mode != "data_parallel" else parallel_cfg.get('mode', 'data_parallel'),
+        schedule_mode=args.schedule,
+        pipeline_stages=args.stages if args.stages != 1 else parallel_cfg.get('pipeline_stages', 1),
+        pipeline_micro_batch=args.micro_batch if args.micro_batch != 4 else parallel_cfg.get('pipeline_micro_batch', 4),
+        tensor_parallel_size=args.tp_size if args.tp_size != 1 else parallel_cfg.get('tensor_parallel_size', 1),
+        hybrid_dp_size=args.dp if args.dp != 1 else parallel_cfg.get('hybrid_dp_size', 1),
+        hybrid_tp_size=args.tp if args.tp != 1 else parallel_cfg.get('hybrid_tp_size', 1),
+        hybrid_pp_size=args.pp if args.pp != 1 else parallel_cfg.get('hybrid_pp_size', 1),
+        
+        # 负载均衡
+        load_balance_strategy=args.load_balance if args.load_balance != "adaptive" else lb_cfg.get('strategy', 'adaptive'),
+        straggler_threshold=args.straggler_threshold if args.straggler_threshold != 2.0 else lb_cfg.get('straggler_threshold', 2.0),
+        auto_rebalance=lb_cfg.get('auto_rebalance', True),
+        
+        # 自动模式
+        auto_mode=args.auto,
+        
+        # 日志
+        log_level=args.log_level if args.log_level != "INFO" else logging_cfg.get('level', 'INFO'),
+        log_file=logging_cfg.get('file', ''),
+        
+        # 健康检查
+        health_check_interval=health_cfg.get('check_interval', 5.0),
+    )
+    
+    # 保存 ngrok 配置到 config 对象（扩展属性）
+    config.ngrok_enabled = args.ngrok or ngrok_cfg.get('enabled', False)
+    config.ngrok_auth_token = args.ngrok_auth_token if args.ngrok_auth_token else ngrok_cfg.get('auth_token', '')
+    config.ngrok_region = args.ngrok_region if args.ngrok_region != "ap" else ngrok_cfg.get('region', 'ap')
+    
+    # 保存路径配置
+    config.model_cache_dir = paths_cfg.get('model_cache', '')
+    config.log_dir = paths_cfg.get('log_dir', 'logs')
+    config.data_dir = paths_cfg.get('data_dir', 'data')
+    
+    # 设置模型缓存目录
+    if config.model_cache_dir:
+        os.environ['HF_HOME'] = config.model_cache_dir
+    
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="统一分布式推理系统",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
+  # 使用默认配置
+  python %(prog)s
+  
+  # 使用配置文件
+  python %(prog)s --config config.json
+  
   # 自动模式选择
   python %(prog)s --auto
 
@@ -1826,11 +2435,19 @@ def main():
   # 多节点集群
   python %(prog)s --port 5000  # 第一个节点
   python %(prog)s --port 5001 --seeds "192.168.1.1:5000"  # 后续节点
+  
+  # 启用 Ngrok 公网暴露
+  python %(prog)s --ngrok --ngrok-auth-token YOUR_TOKEN
         """
     )
     
+    # 配置文件
+    parser.add_argument("--config", type=str, default="config.json", help="配置文件路径")
+    
     # 基础配置
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="节点主机")
     parser.add_argument("--port", type=int, default=5000, help="节点端口")
+    parser.add_argument("--api-host", type=str, default="0.0.0.0", help="API主机")
     parser.add_argument("--api-port", type=int, default=8080, help="API端口")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="模型名称")
     parser.add_argument("--seeds", type=str, default="", help="种子节点 (host:port,host:port)")
@@ -1865,6 +2482,11 @@ def main():
     # 自动模式
     parser.add_argument("--auto", action="store_true", help="自动选择最佳模式")
     
+    # Ngrok 配置
+    parser.add_argument("--ngrok", action="store_true", help="使用 ngrok 暴露公网地址")
+    parser.add_argument("--ngrok-auth-token", type=str, default="", help="ngrok 认证令牌")
+    parser.add_argument("--ngrok-region", type=str, default="ap", help="ngrok 区域 (us, eu, ap, au, sa, jp, in)")
+    
     # 日志
     parser.add_argument("--log-level", type=str, default="INFO",
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1872,25 +2494,11 @@ def main():
     
     args = parser.parse_args()
     
-    # 创建配置
-    config = UnifiedConfig(
-        port=args.port,
-        api_port=args.api_port,
-        model_name=args.model,
-        seeds=args.seeds.split(",") if args.seeds else [],
-        parallel_mode=args.mode,
-        schedule_mode=args.schedule,
-        pipeline_stages=args.stages,
-        pipeline_micro_batch=args.micro_batch,
-        tensor_parallel_size=args.tp_size,
-        hybrid_dp_size=args.dp,
-        hybrid_tp_size=args.tp,
-        hybrid_pp_size=args.pp,
-        load_balance_strategy=args.load_balance,
-        straggler_threshold=args.straggler_threshold,
-        auto_mode=args.auto,
-        log_level=args.log_level,
-    )
+    # 加载配置文件
+    file_config = load_config_file(args.config)
+    
+    # 合并配置（命令行 > 配置文件 > 默认值）
+    config = merge_config(args, file_config)
     
     # 自动模式选择
     if args.auto:
@@ -1913,9 +2521,75 @@ def main():
         mode_info = ModeSelector.get_mode_info(mode)
         print(f"[自动模式] {mode_info.get('name', '')}: {mode_info.get('description', '')}")
     
+    # Ngrok 隧道设置
+    ngrok_url = None
+    ngrok_tunnel = None
+    
+    if config.ngrok_enabled:
+        if not HAS_NGROK:
+            print("\n[错误] pyngrok 未安装，请运行: pip install pyngrok")
+            print("       或者访问 https://ngrok.com 注册并获取 authtoken")
+            sys.exit(1)
+        
+        print("\n[Ngrok] 正在创建公网隧道...")
+        
+        try:
+            # 设置认证令牌
+            if config.ngrok_auth_token:
+                ngrok.set_auth_token(config.ngrok_auth_token)
+            
+            # 为节点通信端口创建隧道
+            node_tunnel = ngrok.connect(
+                config.port,
+                region=config.ngrok_region,
+                proto="tcp"
+            )
+            node_public_url = node_tunnel.public_url
+            print(f"[Ngrok] 节点通信地址: {node_public_url}")
+            
+            # 为 API 端口创建隧道
+            api_tunnel = ngrok.connect(
+                config.api_port,
+                region=config.ngrok_region,
+                proto="http"
+            )
+            ngrok_url = api_tunnel.public_url
+            print(f"[Ngrok] API 公网地址: {ngrok_url}")
+            print(f"[Ngrok] 健康检查: {ngrok_url}/health")
+            print(f"[Ngrok] Web UI: {ngrok_url}")
+            
+            # 保存隧道引用以便后续关闭
+            ngrok_tunnel = (node_tunnel, api_tunnel)
+            
+            # 更新配置中的公网地址
+            # 其他节点可以通过这个地址连接
+            print(f"\n[Ngrok] 其他节点连接命令:")
+            print(f"       python node_unified_complete.py --port {config.port + 1} --api-port {config.api_port + 1} --seeds \"{node_public_url.replace('tcp://', '')}\"")
+            
+        except Exception as e:
+            print(f"[Ngrok 错误] {e}")
+            print("\n提示:")
+            print("  1. 访问 https://dashboard.ngrok.com/get-started/your-authtoken 获取 authtoken")
+            print("  2. 运行: python node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN")
+            sys.exit(1)
+    
     # 创建并启动节点
-    node = UnifiedNode(config)
-    node.start()
+    try:
+        node = UnifiedNode(config)
+        node.start()
+    except KeyboardInterrupt:
+        print("\n[系统] 正在停止...")
+    finally:
+        # 关闭 ngrok 隧道
+        if ngrok_tunnel:
+            print("\n[Ngrok] 关闭公网隧道...")
+            try:
+                for tunnel in ngrok_tunnel:
+                    ngrok.disconnect(tunnel.public_url)
+                ngrok.kill()
+                print("[Ngrok] 隧道已关闭")
+            except:
+                pass
 
 
 if __name__ == "__main__":

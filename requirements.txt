@@ -20,6 +20,9 @@ safetensors>=0.3.0
 # API 服务依赖
 requests>=2.28.0
 
+# 公网暴露（可选）
+pyngrok>=5.0.0
+
 # 开发依赖（可选）
 # pytest>=7.0.0
 # black>=23.0.0

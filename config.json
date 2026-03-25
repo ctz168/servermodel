@@ -1,0 +1,71 @@
+{
+  "node": {
+    "name": "",
+    "host": "0.0.0.0",
+    "port": 5000,
+    "api_host": "0.0.0.0",
+    "api_port": 8080
+  },
+  
+  "model": {
+    "name": "Qwen/Qwen2.5-0.5B-Instruct",
+    "cache_dir": "",
+    "device": "auto",
+    "precision": "auto",
+    "max_workers": 2,
+    "memory_gb": 2.0
+  },
+  
+  "cluster": {
+    "seeds": [],
+    "discovery_port": 9000,
+    "heartbeat_interval": 2.0,
+    "election_timeout_min": 3.0,
+    "election_timeout_max": 6.0,
+    "leader_timeout": 10.0,
+    "node_timeout": 30.0
+  },
+  
+  "parallel": {
+    "mode": "data_parallel",
+    "pipeline_stages": 1,
+    "pipeline_micro_batch": 4,
+    "tensor_parallel_size": 1,
+    "hybrid_dp_size": 1,
+    "hybrid_tp_size": 1,
+    "hybrid_pp_size": 1
+  },
+  
+  "load_balance": {
+    "strategy": "adaptive",
+    "straggler_threshold": 2.0,
+    "auto_rebalance": true
+  },
+  
+  "ngrok": {
+    "enabled": false,
+    "auth_token": "",
+    "region": "ap",
+    "api_tunnel_name": "api",
+    "node_tunnel_name": "node"
+  },
+  
+  "paths": {
+    "model_cache": "",
+    "log_dir": "logs",
+    "data_dir": "data"
+  },
+  
+  "logging": {
+    "level": "INFO",
+    "file": "",
+    "max_size_mb": 100,
+    "backup_count": 5
+  },
+  
+  "health": {
+    "check_interval": 5.0,
+    "max_retries": 3,
+    "timeout": 10.0
+  }
+}
