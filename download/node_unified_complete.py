@@ -121,6 +121,12 @@ class MessageType(Enum):
     NODE_JOIN = "node_join"
     NODE_LEAVE = "node_leave"
     
+    # 集群资源协调
+    CLUSTER_RESOURCE_QUERY = "cluster_resource_query"
+    CLUSTER_RESOURCE_RESPONSE = "cluster_resource_response"
+    CLUSTER_READY = "cluster_ready"
+    CLUSTER_START_DISTRIBUTED = "cluster_start_distributed"
+    
     # 心跳
     HEARTBEAT = "heartbeat"
     HEARTBEAT_RESPONSE = "heartbeat_response"
@@ -474,6 +480,61 @@ class ResourceMonitor:
             return False, f"内存不足: {info['memory_available_gb']:.1f}GB < {model_memory_gb * 1.2:.1f}GB"
         
         return True, "资源充足"
+    
+    @staticmethod
+    def estimate_model_size(model_name: str) -> float:
+        """
+        估算模型所需内存（GB）
+        
+        Args:
+            model_name: 模型名称
+            
+        Returns:
+            估算的内存需求（GB）
+        """
+        try:
+            # 尝试从模型名称推断大小
+            # 常见模型大小映射
+            known_models = {
+                "Qwen/Qwen2.5-0.5B-Instruct": 1.0,
+                "Qwen/Qwen2.5-1.5B-Instruct": 3.0,
+                "Qwen/Qwen2.5-3B-Instruct": 6.0,
+                "Qwen/Qwen2.5-7B-Instruct": 14.0,
+                "Qwen/Qwen2.5-14B-Instruct": 28.0,
+                "Qwen/Qwen2.5-32B-Instruct": 64.0,
+                "Qwen/Qwen2.5-72B-Instruct": 144.0,
+                "Qwen/Qwen2-0.5B-Instruct": 1.0,
+                "Qwen/Qwen2-1.5B-Instruct": 3.0,
+                "Qwen/Qwen2-7B-Instruct": 14.0,
+                "Qwen/Qwen2-72B-Instruct": 144.0,
+                "meta-llama/Llama-2-7b-hf": 14.0,
+                "meta-llama/Llama-2-13b-hf": 26.0,
+                "meta-llama/Llama-2-70b-hf": 140.0,
+                "meta-llama/Meta-Llama-3-8B": 16.0,
+                "meta-llama/Meta-Llama-3-70B": 140.0,
+            }
+            
+            # 精确匹配
+            if model_name in known_models:
+                return known_models[model_name]
+            
+            # 从名称推断（基于参数量）
+            import re
+            
+            # 提取参数量（如 7B, 13B, 70B）
+            match = re.search(r'(\d+(?:\.\d+)?)\s*[Bb]', model_name)
+            if match:
+                params_b = float(match.group(1))
+                # FP16: 每个参数约2字节，加上开销约3倍
+                # 估算: params_b * 2GB * 1.5 (开销)
+                return params_b * 2.0 * 1.5
+            
+            # 默认值（保守估计）
+            return 8.0  # 假设需要8GB
+            
+        except Exception as e:
+            print(f"[资源] 无法估算模型大小: {e}")
+            return 8.0  # 默认8GB
 
 
 # ==================== 模式选择器 ====================
@@ -1283,7 +1344,7 @@ class RaftElection:
     def _become_leader(self):
         """成为领导节点"""
         self.elections_won += 1
-        print(f"[选举] 🎉 成为领导节点! 任期 {self.current_term}")
+        print(f"[选举] [LEADER] 成为领导节点! 任期 {self.current_term}")
         
         self.role = NodeRole.LEADER
         self.leader_id = self.node_id
@@ -2042,6 +2103,13 @@ class UnifiedNode:
         self.pipeline_enabled = False
         self.pipeline_stage_id = -1
         
+        # 集群资源协调
+        self.cluster_resources: Dict[str, Dict] = {}  # node_id -> resource_info
+        self.cluster_resource_lock = threading.Lock()
+        self.waiting_for_cluster = False
+        self.cluster_ready_event = threading.Event()
+        self.distributed_loading_plan: Optional[Dict] = None
+        
         # 状态
         self.running = False
         self.api_server: Optional[HTTPServer] = None
@@ -2067,44 +2135,91 @@ class UnifiedNode:
         # 注册消息处理器
         self._register_handlers()
         
-        # 加载模型
-        if self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL:
-            # Pipeline 并行模式 - 加载模型分片
-            total_stages = self.config.pipeline_stages
-            if total_stages <= 1:
-                print("[警告] Pipeline 阶段数无效，使用默认值 2")
-                total_stages = 2
+        # 估算模型大小
+        model_size_gb = ResourceMonitor.estimate_model_size(self.config.model_name)
+        print(f"\n[模型] 目标模型: {self.config.model_name}")
+        print(f"[模型] 估算大小: {model_size_gb:.1f}GB")
+        print(f"[模型] 可用内存: {self.node_info.memory_available_gb:.1f}GB")
+        
+        # 检查内存并决定加载策略
+        use_distributed = False
+        
+        if self.config.auto_mode or self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL:
+            # 自动模式或Pipeline模式 - 检查是否需要分布式加载
+            can_run, reason = ResourceMonitor.can_run_model(model_size_gb)
             
-            # 确定当前节点的阶段ID
-            # 领导节点为阶段 0，其他节点按加入顺序分配
-            if self.election.state == NodeRole.LEADER:
-                stage_id = 0
+            if not can_run:
+                print(f"\n[资源] 本地内存不足: {reason}")
+                print("[资源] 尝试等待集群资源进行分布式加载...")
+                
+                # 等待集群资源
+                if self._check_and_wait_for_cluster(model_size_gb):
+                    use_distributed = True
+                    # 规划分布式加载
+                    plan = self._plan_distributed_loading(model_size_gb)
+                    
+                    # 执行分布式加载
+                    if not self._coordinate_distributed_loading(plan):
+                        print("[错误] 分布式加载失败")
+                        return
+                else:
+                    print("[错误] 无法获得足够的集群资源，启动失败")
+                    return
             else:
-                # 工作节点根据配置或自动分配阶段
-                stage_id = len(self.network.peers) % total_stages
-            
-            print(f"\n[Pipeline] 加载模型分片...")
-            print(f"[Pipeline] 阶段: {stage_id + 1}/{total_stages}")
-            
-            if not self.model_manager.load_shard(stage_id, total_stages):
-                print("[错误] 模型分片加载失败")
-                return
-            
-            self.pipeline_enabled = True
-            self.pipeline_stage_id = stage_id
-            
-        elif self.config.parallel_mode == ParallelMode.HYBRID:
-            # 混合并行模式
-            # TODO: 实现混合并行
-            print("[警告] 混合并行模式尚未完全实现，使用数据并行")
-            if not self.model_manager.load():
-                print("[错误] 模型加载失败")
-                return
-        else:
-            # 数据并行模式 - 加载完整模型
-            if not self.model_manager.load():
-                print("[错误] 模型加载失败")
-                return
+                # 内存充足，检查是否配置了Pipeline模式
+                if self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL:
+                    use_distributed = True
+                    total_stages = self.config.pipeline_stages
+                    
+                    # 确定阶段ID
+                    if self.election.state == NodeRole.LEADER:
+                        stage_id = 0
+                    else:
+                        stage_id = len(self.network.peers) % total_stages
+                    
+                    print(f"\n[Pipeline] 加载模型分片...")
+                    print(f"[Pipeline] 阶段: {stage_id + 1}/{total_stages}")
+                    
+                    if not self.model_manager.load_shard(stage_id, total_stages):
+                        print("[错误] 模型分片加载失败")
+                        return
+                    
+                    self.pipeline_enabled = True
+                    self.pipeline_stage_id = stage_id
+        
+        # 常规加载（内存充足且不需要分布式）
+        if not use_distributed:
+            if self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL:
+                # Pipeline 模式但不需要等待集群
+                total_stages = self.config.pipeline_stages
+                if total_stages <= 1:
+                    total_stages = 2
+                
+                if self.election.state == NodeRole.LEADER:
+                    stage_id = 0
+                else:
+                    stage_id = len(self.network.peers) % total_stages
+                
+                print(f"\n[Pipeline] 加载模型分片...")
+                print(f"[Pipeline] 阶段: {stage_id + 1}/{total_stages}")
+                
+                if not self.model_manager.load_shard(stage_id, total_stages):
+                    print("[错误] 模型分片加载失败")
+                    return
+                
+                self.pipeline_enabled = True
+                self.pipeline_stage_id = stage_id
+                
+            elif self.config.parallel_mode == ParallelMode.HYBRID:
+                print("[警告] 混合并行模式尚未完全实现，使用数据并行")
+                if not self.model_manager.load():
+                    print("[错误] 模型加载失败")
+                    return
+            else:
+                # 数据并行模式 - 加载完整模型
+                if not self.model_manager.load():
+                    print("[错误] 模型加载失败")
+                    return
         
         self.node_info.model_loaded = True
         self.node_info.model_name = self.config.model_name
@@ -2164,6 +2279,19 @@ class UnifiedNode:
         self.network.register_handler(
             MessageType.PIPELINE_DATA, self._handle_pipeline_data
         )
+        # 集群资源协调处理器
+        self.network.register_handler(
+            MessageType.CLUSTER_RESOURCE_QUERY, 
+            lambda data, from_node: self._handle_cluster_resource_query(data) or {}
+        )
+        self.network.register_handler(
+            MessageType.CLUSTER_RESOURCE_RESPONSE,
+            lambda data, from_node: self._handle_cluster_resource_response(data) or {}
+        )
+        self.network.register_handler(
+            MessageType.CLUSTER_START_DISTRIBUTED,
+            lambda data, from_node: self._handle_cluster_start_distributed(data) or {}
+        )
     
     def _handle_discover(self, data: Dict, from_node: str) -> Dict:
         """处理发现请求"""
@@ -2213,7 +2341,7 @@ class UnifiedNode:
     
     def _on_become_leader(self):
         """成为领导节点回调"""
-        print("[领导] 👑 成为领导节点，开始接受请求")
+        print("[领导] [LEADER] 成为领导节点，开始接受请求")
     
     def _update_resource_info(self):
         """更新资源信息"""
@@ -2225,6 +2353,274 @@ class UnifiedNode:
         self.node_info.gpu_available = info["gpu_available"]
         self.node_info.gpu_memory_gb = info["gpu_memory_gb"]
         self.node_info.health_score = ResourceMonitor.get_health_score()
+    
+    def _check_and_wait_for_cluster(self, model_size_gb: float) -> bool:
+        """
+        检查内存并等待集群资源
+        
+        Args:
+            model_size_gb: 模型大小（GB）
+            
+        Returns:
+            是否成功获得足够资源
+        """
+        # 检查本地内存
+        can_run, reason = ResourceMonitor.can_run_model(model_size_gb)
+        
+        if can_run:
+            print(f"[资源] 本地内存充足: {reason}")
+            return True
+        
+        print(f"\n{'='*60}")
+        print(f"[警告] 本地内存不足!")
+        print(f"  模型需求: {model_size_gb:.1f}GB")
+        print(f"  可用内存: {self.node_info.memory_available_gb:.1f}GB")
+        print(f"  缺少: {model_size_gb * 1.2 - self.node_info.memory_available_gb:.1f}GB")
+        print(f"{'='*60}")
+        
+        # 进入等待集群模式
+        print("\n[集群] 等待其他节点加入以进行分布式加载...")
+        self.waiting_for_cluster = True
+        
+        # 广播资源查询
+        self._broadcast_resource_query(model_size_gb)
+        
+        # 等待集群资源收集完成
+        max_wait_time = 120  # 最多等待2分钟
+        check_interval = 3
+        waited = 0
+        
+        while waited < max_wait_time:
+            # 检查是否有足够的集群资源
+            with self.cluster_resource_lock:
+                total_memory = sum(
+                    r.get("memory_available_gb", 0) 
+                    for r in self.cluster_resources.values()
+                )
+                # 加上自己的内存
+                total_memory += self.node_info.memory_available_gb
+                node_count = len(self.cluster_resources) + 1
+            
+            print(f"\r[集群] 等待中... 已发现 {node_count} 个节点, "
+                  f"总可用内存: {total_memory:.1f}GB / {model_size_gb * 1.2:.1f}GB  "
+                  f"({waited}s/{max_wait_time}s)", end="", flush=True)
+            
+            # 检查是否满足条件
+            if total_memory >= model_size_gb * 1.2 and node_count >= 2:
+                print(f"\n\n[集群] 检测到足够的集群资源!")
+                print(f"  节点数: {node_count}")
+                print(f"  总内存: {total_memory:.1f}GB")
+                self.waiting_for_cluster = False
+                return True
+            
+            # 等待一段时间
+            time.sleep(check_interval)
+            waited += check_interval
+        
+        print(f"\n\n[警告] 等待超时，无法获得足够的集群资源")
+        self.waiting_for_cluster = False
+        return False
+    
+    def _broadcast_resource_query(self, model_size_gb: float):
+        """广播资源查询消息"""
+        message = {
+            "type": MessageType.CLUSTER_RESOURCE_QUERY.value,
+            "node_id": self.node_info.node_id,
+            "host": self.node_info.host,
+            "port": self.node_info.port,
+            "model_name": self.config.model_name,
+            "model_size_gb": model_size_gb,
+            "timestamp": time.time(),
+        }
+        
+        # 发送到已知节点
+        for node_id, node_info in self.network.known_nodes.items():
+            try:
+                if node_info.host and node_info.port:
+                    self.network.send_message(node_info.host, node_info.port, message)
+            except Exception as e:
+                print(f"[集群] 发送资源查询失败: {e}")
+        
+        # 也发送到种子节点
+        for seed in self.config.seeds:
+            try:
+                parts = seed.split(":")
+                host = parts[0]
+                port = int(parts[1]) if len(parts) > 1 else 5000
+                self.network.send_message(host, port, message)
+            except Exception as e:
+                print(f"[集群] 发送到种子节点失败: {e}")
+    
+    def _handle_cluster_resource_query(self, message: Dict):
+        """处理集群资源查询"""
+        # 更新资源信息
+        self._update_resource_info()
+        
+        # 响应当前节点的资源状态
+        response = {
+            "type": MessageType.CLUSTER_RESOURCE_RESPONSE.value,
+            "node_id": self.node_info.node_id,
+            "node_name": self.node_info.node_name,
+            "memory_total_gb": self.node_info.memory_total_gb,
+            "memory_available_gb": self.node_info.memory_available_gb,
+            "gpu_available": self.node_info.gpu_available,
+            "gpu_memory_gb": self.node_info.gpu_memory_gb,
+            "cpu_cores": self.node_info.cpu_cores,
+            "host": self.node_info.host,
+            "port": self.node_info.port,
+            "timestamp": time.time(),
+        }
+        
+        # 发送响应
+        sender_host = message.get("host", "")
+        sender_port = message.get("port", 0)
+        if sender_host and sender_port:
+            self.network.send_message(sender_host, sender_port, response)
+    
+    def _handle_cluster_resource_response(self, message: Dict):
+        """处理集群资源响应"""
+        node_id = message.get("node_id", "")
+        
+        with self.cluster_resource_lock:
+            self.cluster_resources[node_id] = {
+                "node_id": node_id,
+                "node_name": message.get("node_name", ""),
+                "memory_total_gb": message.get("memory_total_gb", 0),
+                "memory_available_gb": message.get("memory_available_gb", 0),
+                "gpu_available": message.get("gpu_available", False),
+                "gpu_memory_gb": message.get("gpu_memory_gb", 0),
+                "cpu_cores": message.get("cpu_cores", 0),
+                "host": message.get("host", ""),
+                "port": message.get("port", 0),
+            }
+    
+    def _plan_distributed_loading(self, model_size_gb: float) -> Dict:
+        """
+        规划分布式加载方案
+        
+        Args:
+            model_size_gb: 模型大小
+            
+        Returns:
+            加载计划
+        """
+        with self.cluster_resource_lock:
+            # 收集所有节点（包括自己）
+            all_nodes = [
+                {
+                    "node_id": self.node_info.node_id,
+                    "memory_available_gb": self.node_info.memory_available_gb,
+                    "host": self.node_info.host,
+                    "port": self.node_info.port,
+                }
+            ]
+            all_nodes.extend(list(self.cluster_resources.values()))
+        
+        # 按可用内存排序
+        all_nodes.sort(key=lambda x: x.get("memory_available_gb", 0), reverse=True)
+        
+        # 计算总内存和每节点分片大小
+        total_memory = sum(n.get("memory_available_gb", 0) for n in all_nodes)
+        memory_per_node = model_size_gb * 1.2 / len(all_nodes)  # 每节点需要的内存
+        
+        # 选择能够参与分片的节点
+        participating_nodes = [
+            n for n in all_nodes 
+            if n.get("memory_available_gb", 0) >= memory_per_node * 0.8
+        ]
+        
+        if len(participating_nodes) < 2:
+            # 如果没有足够节点，使用所有可用节点
+            participating_nodes = all_nodes[:max(len(all_nodes), 1)]
+        
+        # 分配阶段ID
+        num_stages = len(participating_nodes)
+        for i, node in enumerate(participating_nodes):
+            node["stage_id"] = i
+            node["total_stages"] = num_stages
+        
+        plan = {
+            "model_name": self.config.model_name,
+            "model_size_gb": model_size_gb,
+            "num_stages": num_stages,
+            "nodes": participating_nodes,
+            "created_at": time.time(),
+        }
+        
+        print(f"\n[集群] 分布式加载计划:")
+        print(f"  模型: {self.config.model_name}")
+        print(f"  大小: {model_size_gb:.1f}GB")
+        print(f"  分片数: {num_stages}")
+        for node in participating_nodes:
+            print(f"  节点 {node.get('node_name', node.get('node_id', 'unknown'))}: "
+                  f"阶段 {node.get('stage_id', 0)+1}/{num_stages}, "
+                  f"内存 {node.get('memory_available_gb', 0):.1f}GB")
+        
+        return plan
+    
+    def _coordinate_distributed_loading(self, plan: Dict):
+        """协调分布式加载"""
+        self.distributed_loading_plan = plan
+        
+        # 找到自己的分配
+        my_stage_id = None
+        my_total_stages = plan["num_stages"]
+        
+        for node in plan["nodes"]:
+            if node.get("node_id") == self.node_info.node_id:
+                my_stage_id = node.get("stage_id")
+                break
+        
+        if my_stage_id is None:
+            print("[错误] 未在加载计划中找到本节点")
+            return False
+        
+        # 发送启动消息给所有参与节点
+        for node in plan["nodes"]:
+            if node.get("node_id") != self.node_info.node_id:
+                message = {
+                    "type": MessageType.CLUSTER_START_DISTRIBUTED.value,
+                    "node_id": self.node_info.node_id,
+                    "plan": plan,
+                    "target_node_id": node.get("node_id"),
+                    "target_stage_id": node.get("stage_id"),
+                }
+                try:
+                    host = node.get("host", "")
+                    port = node.get("port", 0)
+                    if host and port:
+                        self.network.send_message(host, port, message)
+                except Exception as e:
+                    print(f"[集群] 发送分布式加载指令失败: {e}")
+        
+        # 自己也加载分片
+        print(f"\n[Pipeline] 开始加载模型分片...")
+        print(f"[Pipeline] 本节点阶段: {my_stage_id + 1}/{my_total_stages}")
+        
+        if self.model_manager.load_shard(my_stage_id, my_total_stages):
+            self.pipeline_enabled = True
+            self.pipeline_stage_id = my_stage_id
+            return True
+        
+        return False
+    
+    def _handle_cluster_start_distributed(self, message: Dict):
+        """处理分布式加载指令"""
+        plan = message.get("plan", {})
+        target_stage_id = message.get("target_stage_id")
+        
+        print(f"\n[集群] 收到分布式加载指令")
+        print(f"[Pipeline] 本节点阶段: {target_stage_id + 1}/{plan.get('num_stages', 2)}")
+        
+        # 加载分片
+        if self.model_manager.load_shard(target_stage_id, plan.get("num_stages", 2)):
+            self.pipeline_enabled = True
+            self.pipeline_stage_id = target_stage_id
+            self.node_info.model_loaded = True
+            self.node_info.model_name = plan.get("model_name", "")
+            print(f"[Pipeline] 分片加载成功!")
+        else:
+            print(f"[Pipeline] 分片加载失败!")
     
     def _heartbeat_loop(self):
         """心跳循环"""
@@ -2381,7 +2777,7 @@ def merge_config(args, file_config: Dict) -> UnifiedConfig:
         auto_rebalance=lb_cfg.get('auto_rebalance', True),
         
         # 自动模式
-        auto_mode=args.auto,
+        auto_mode=args.auto if hasattr(args, 'auto') and args.auto else node_cfg.get('auto', False),
         
         # 日志
         log_level=args.log_level if args.log_level != "INFO" else logging_cfg.get('level', 'INFO'),

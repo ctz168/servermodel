@@ -4,16 +4,17 @@
     "host": "0.0.0.0",
     "port": 5000,
     "api_host": "0.0.0.0",
-    "api_port": 8080
+    "api_port": 8080,
+    "auto": true
   },
   
   "model": {
-    "name": "Qwen/Qwen2.5-0.5B-Instruct",
+    "name": "Qwen/Qwen2.5-3B-Instruct",
     "cache_dir": "",
     "device": "auto",
     "precision": "auto",
     "max_workers": 2,
-    "memory_gb": 2.0
+    "memory_gb": 6.0
   },
   
   "cluster": {
@@ -23,7 +24,9 @@
     "election_timeout_min": 3.0,
     "election_timeout_max": 6.0,
     "leader_timeout": 10.0,
-    "node_timeout": 30.0
+    "node_timeout": 30.0,
+    "wait_for_cluster": true,
+    "max_wait_time": 120
   },
   
   "parallel": {
