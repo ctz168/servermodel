@@ -5,34 +5,48 @@ __pycache__/
 *.so
 .Python
 venv/
-.venv/
-*.egg-info/
-.eggs/
+env/
+ENV/
+.venv
 
-# Logs
-*.log
-logs/
-
-# Environment
-.env
-.env.local
-
-# IDE
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Temporary
-*.tmp
-*.temp
+# 模型缓存
 .cache/
-
-# Model cache
 models/
 *.bin
 *.safetensors
+*.gguf
+
+# 日志
+logs/
+*.log
+stdout.txt
+stderr.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 测试
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 临时文件
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Ngrok
+ngrok.log
+
+# 项目特定
+.node_id
+*.pid
