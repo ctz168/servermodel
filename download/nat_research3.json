@@ -1,0 +1,47 @@
+[
+  {
+    "url": "https://stackoverflow.com/questions/25723783/how-to-use-libminiupnpc-to-setup-port-forwarding",
+    "name": "how to use libminiupnpc to setup port forwarding - Stack Overflow",
+    "snippet": "I'd like to use libminiupnpc (github) to find devices and do TCP port forwarding/mapping. However, I cannot find a single decent document or example code that ... Python: Open a Listening Port Behind a Router (upnp?) Peer to peer connection, when one peer behind NAT - Stack Overflow More results from stackoverflow.com Missing: PMP punching",
+    "host_name": "stackoverflow.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://miniupnp.tuxfamily.org/forum/viewtopic.php?t=1835",
+    "name": "View topic - Why are my ports mapped using MiniUPNPC not",
+    "snippet": "I am having trouble debugging why mapping ports using miniupnpc is not working even though the miniupnpc tool says that it worked. Context I'm ... Missing: python auto hole punching",
+    "host_name": "miniupnp.tuxfamily.org",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://github.com/ntop/n2n/issues/147",
+    "name": "UPnP / NAT-PMP support · Issue #147 · ntop/n2n - GitHub",
+    "snippet": "As is, edges rely on the user manually port forwarding and will most likely fail on symmetric NAT (or will rely on supernode relaying.) ... Missing: python auto hole punching",
+    "host_name": "github.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://askubuntu.com/questions/64102/how-do-i-fix-upnp-port-forwarding-on-ubuntu-using-miniupnp",
+    "name": "How do I fix UPnP Port Forwarding on Ubuntu using miniupnp?",
+    "snippet": "I just used upnp-router-control to add a port forwarding to my router and it worked like a charm :) If that doesn't work for you i would suggest you use ... Missing: miniupnpc python PMP punching",
+    "host_name": "askubuntu.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://forum.mikrotik.com/t/cant-get-upnp-to-work/171172",
+    "name": "can't get upnp to work - General - MikroTik community forum",
+    "snippet": "I can't get upnp to work with RouterOS 7.12. It seems to enabled: [admin@vno1-commbox] > /ip upnp print enabled: yes allow-disable-external-interface: no show- ... Missing: hole punching",
+    "host_name": "forum.mikrotik.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  }
+]

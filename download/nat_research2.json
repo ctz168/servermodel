@@ -1,0 +1,47 @@
+[
+  {
+    "url": "https://github.com/amirR01/UDP-Hole-Punching",
+    "name": "This is a simple implementation of UDP Hole Punching in Python",
+    "snippet": "This is a simple implementation of UDP Hole Punching in Python. It is a simple P2P connection between two clients behind NATs. Missing: traversal | Show results with: traversal",
+    "host_name": "github.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://stackoverflow.com/questions/31702125/hole-punching-using-stun",
+    "name": "Hole punching using STUN - udp - Stack Overflow",
+    "snippet": "Hole punching is technically not impossible if both sides have symmetric NAT (although the traversal process may be too unreliable to be worth the hassle). Python NAT Hole Punching - tcp Failing to perform TCP hole punching using STUN More results from stackoverflow.com",
+    "host_name": "stackoverflow.com",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://itnext.io/p2p-nat-traversal-how-to-punch-a-hole-9abc8ffa758e",
+    "name": "P2P NAT Traversal— How to punch a hole | by Branimir Malesevic",
+    "snippet": "NAT Traversal is a collection of techniques used to establish a connection between two devices that are behind different NATs or firewalls.",
+    "host_name": "itnext.io",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://medium.com/@girish1729/nat-with-udp-hole-punching-39d952cbc075",
+    "name": "NAT with UDP hole punching - Medium",
+    "snippet": "This article discusses a possible solution to solving the NAT problem for P2P protocols. What Is Wrong with NAT? NAT breaks the Internet more ...",
+    "host_name": "medium.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://news.ycombinator.com/item?id=42600846",
+    "name": "How NAT Traversal Works (2020) - Hacker News",
+    "snippet": "These methods are needed for traversing between any two networks behind stateful firewalls, which will pose a barrier to P2P indefinitely.",
+    "host_name": "news.ycombinator.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  }
+]

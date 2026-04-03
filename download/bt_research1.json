@@ -1,0 +1,47 @@
+[
+  {
+    "url": "https://stackoverflow.com/questions/51004291/how-to-communicate-between-two-nodes-behind-nat",
+    "name": "How to communicate between two Nodes behind NAT?",
+    "snippet": "The idea is that you have a rendez-vous server, which the nodes 1 and 2 connect to. For that they must know the IP of the rendez-vous server. How to create a P2P connection when both clients are behind NAT Establishing P2P TCP/UDP connections (NAT traversal) More results from stackoverflow.com Missing: Bitcoin mechanism",
+    "host_name": "stackoverflow.com",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.researchgate.net/publication/352661972_The_Bitcoin_P2P_Network_Topology_A_Centralized_Architecture",
+    "name": "The Bitcoin P2P Network Topology: A Centralized Architecture",
+    "snippet": "... nodes are greyed while unrouteable nodes behind a proxy or NAT are located to the of. the vertical line to distinguish them from routable nodes.",
+    "host_name": "www.researchgate.net",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://news.ycombinator.com/item?id=42600846",
+    "name": "How NAT Traversal Works (2020) - Hacker News",
+    "snippet": "These methods are needed for traversing between any two networks behind stateful firewalls, which will pose a barrier to P2P indefinitely.",
+    "host_name": "news.ycombinator.com",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://medium.com/@akpnrkoray/nat-traversal-and-blockchain-36eea298e5e1",
+    "name": "NAT Traversal and Blockchain - Medium",
+    "snippet": "NAT Traversal is a crucial method that enables P2P (peer-to-peer) connections in networks that include a NAT device. Missing: mechanism | Show results with: mechanism",
+    "host_name": "medium.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://research.protocol.ai/publications/rewarding-relays-for-decentralised-nat-traversal-using-smart-contracts/psaras2020a.pdf",
+    "name": "[PDF] Rewarding Relays for Decentralised NAT Traversal Using Smart",
+    "snippet": "In this paper, we propose a decentralised, relay-based NAT tra- versal system for P2P networks with a built-in reward system for relays who assist nodes in ...",
+    "host_name": "research.protocol.ai",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  }
+]

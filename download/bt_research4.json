@@ -1,0 +1,47 @@
+[
+  {
+    "url": "https://inria.hal.science/hal-03380595/file/brains2021_Bitcoin_P2P_network_study.pdf",
+    "name": "A Comprehensive Study of the Bitcoin P2P Network",
+    "snippet": "2021 · Cited by 24 — Abstract—The Bitcoin peer -to- peer network ensures the consensus between the different nodes responsible for the propagation of the blocks ... 9 pages",
+    "host_name": "inria.hal.science",
+    "rank": 0,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://developer.bitcoin.org/devguide/p2p_network.html",
+    "name": "P2P Network",
+    "snippet": "The Bitcoin network protocol allows full nodes ( peers ) to collaboratively maintain a peer -to- peer network for block and transaction exchange.",
+    "host_name": "developer.bitcoin.org",
+    "rank": 1,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://sec.cs.univie.ac.at/fileadmin/user_upload/i_sec/docs/teaching/thesis/2023/Klonowski_Timo_-_2023_-_Bitcoin_Network_Topology_Discovery_Using_Timing_Analysis.pdf",
+    "name": "Bitcoin Network Topology Discovery Using Timing Analysis",
+    "snippet": "Cited by 2 — We propose a method to exploit the relaying of address messages in the network to measure the topology of the network . To do this, we combine a node degree ... 114 pages",
+    "host_name": "sec.cs.univie.ac.at",
+    "rank": 2,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.bitstack-app.com/en/learn-bitcoin/launching-new-node",
+    "name": "How does a new node launch on the Bitcoin network?",
+    "snippet": "18 Sept 2025 — By default, a Bitcoin Core node attempts to establish connections with 8 outgoing peers . These connections are generally considered to be ...",
+    "host_name": "www.bitstack-app.com",
+    "rank": 3,
+    "date": "",
+    "favicon": ""
+  },
+  {
+    "url": "https://www.sciencedirect.com/science/article/pii/S2096720921000439",
+    "name": "Security and performance evaluation of master node",
+    "snippet": "2022 · Cited by 19 — This paper introduces a proximity-aware extension to the current Bitcoin protocol, named Master Node Based Clustering (MNBC).",
+    "host_name": "www.sciencedirect.com",
+    "rank": 4,
+    "date": "",
+    "favicon": ""
+  }
+]
