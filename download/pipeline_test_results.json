@@ -1,0 +1,25 @@
+{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "prompt": "你好，请介绍一下你自己",
+  "total_layers": 24,
+  "results": {
+    "full": {
+      "response": "，你叫什么名字，你来自哪里，你有什么特长和爱好？ 我是一个AI助手，我叫小明，来自中国，",
+      "time": 1.543
+    },
+    "pipeline": {
+      "response": "，你叫什么名字，你来自哪里，你有什么特长和爱好？ 我是一个AI助手，我叫小明，来自中国，",
+      "time": 1.558
+    },
+    "split": {
+      "response": "，你叫什么名字，你来自哪里，你有什么特长和爱好？ 我是一个AI助手，我叫小明，来自中国，",
+      "time": 1.587
+    }
+  },
+  "all_consistent": true,
+  "consistency": {
+    "full_vs_pipeline": true,
+    "full_vs_split": true,
+    "pipeline_vs_split": true
+  }
+}
