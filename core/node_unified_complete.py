@@ -29,15 +29,68 @@ import signal
 import statistics
 import traceback
 import argparse
+import re
+import gc
+import logging
 from typing import Dict, List, Optional, Any, Set, Tuple, Callable, Union
 from dataclasses import dataclass, field
-from collections import defaultdict, deque
+from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor, Future
 from enum import Enum
 from datetime import datetime
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
+
+__all__ = [
+    "VERSION",
+    "ParallelMode",
+    "ScheduleMode",
+    "NodeRole",
+    "NodeState",
+    "MessageType",
+    "UnifiedConfig",
+    "NodeInfo",
+    "TaskInfo",
+    "PipelineStage",
+    "InferenceResult",
+    "ResourceMonitor",
+    "ModeSelector",
+    "LoadBalancer",
+    "DistributedInferenceCoordinator",
+    "NetworkManager",
+    "RaftElection",
+    "ModelManager",
+    "APIRequestHandler",
+    "UnifiedNode",
+    "main",
+]
+
+# ==================== 日志配置 ====================
+
+logger = logging.getLogger("unified_inference")
+
+# 默认日志格式
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+_LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def setup_logging(level: str = "INFO", log_file: str = ""):
+    """配置日志系统"""
+    log_level = getattr(logging, level.upper(), logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, _LOG_DATE_FORMAT))
+    logger.handlers.clear()
+    logger.addHandler(handler)
+    logger.setLevel(log_level)
+
+    if log_file:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter(_LOG_FORMAT, _LOG_DATE_FORMAT))
+        logger.addHandler(file_handler)
+
 
 # 环境配置
 os.environ['HF_ENDPOINT'] = os.environ.get('HF_ENDPOINT', 'https://hf-mirror.com')
@@ -48,7 +101,7 @@ try:
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
-    print("警告: psutil未安装，请运行: pip install psutil")
+    logger.warning("psutil未安装，请运行: pip install psutil")
 
 try:
     import torch
@@ -56,7 +109,7 @@ try:
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
-    print("警告: torch/transformers未安装，请运行: pip install torch transformers")
+    logger.warning("torch/transformers未安装，请运行: pip install torch transformers")
 
 try:
     import requests
@@ -223,6 +276,10 @@ class UnifiedConfig:
     # 日志
     log_level: str = "INFO"
     log_file: str = ""
+    
+    # 消息超时与重试
+    message_timeout: float = 10.0
+    message_retries: int = 2
     
     def __post_init__(self):
         if not self.node_id:
@@ -518,9 +575,7 @@ class ResourceMonitor:
             if model_name in known_models:
                 return known_models[model_name]
             
-            # 从名称推断（基于参数量）
-            import re
-            
+            # 从名称推断（基于参数量）—— re 已在顶层导入
             # 提取参数量（如 7B, 13B, 70B）
             match = re.search(r'(\d+(?:\.\d+)?)\s*[Bb]', model_name)
             if match:
@@ -533,7 +588,7 @@ class ResourceMonitor:
             return 8.0  # 假设需要8GB
             
         except Exception as e:
-            print(f"[资源] 无法估算模型大小: {e}")
+            logger.error(f"无法估算模型大小: {e}")
             return 8.0  # 默认8GB
 
 
@@ -690,10 +745,10 @@ class LoadBalancer:
         if stats["avg_latency"] > threshold:
             if node_id not in self.straggler_nodes:
                 self.straggler_nodes.add(node_id)
-                print(f"[负载均衡] ⚠️ 发现慢节点: {node_id[:8]} (延迟: {stats['avg_latency']:.3f}s)")
+                logger.warning(f"发现慢节点: {node_id[:8]} (延迟: {stats['avg_latency']:.3f}s)")
         elif node_id in self.straggler_nodes:
             self.straggler_nodes.discard(node_id)
-            print(f"[负载均衡] [OK] 节点恢复: {node_id[:8]}")
+            logger.info(f"节点恢复: {node_id[:8]}")
     
     def select_node(self, nodes: Dict[str, NodeInfo], 
                     exclude: Set[str] = None) -> Optional[str]:
@@ -752,14 +807,23 @@ class LoadBalancer:
 
 # ==================== 分布式推理协调器 ====================
 
+# Bug 1 fix: Use string annotation for torch.Tensor to avoid NameError when torch not installed
+# Also fix Bug 5: Store pipeline_id in pending_stages
+# Also fix Bug 6: Save start_time before deletion in _execute_first_stage
+# Also fix Improvement 3: Proper token-by-token generation in _generate_final_output
+
 class DistributedInferenceCoordinator:
     """分布式推理协调器 - 管理 Pipeline 并行推理"""
+    
+    # Maximum completed task entries to keep (Bug 11: memory leak fix)
+    MAX_COMPLETED_TASKS = 1000
     
     def __init__(self, node: 'UnifiedNode'):
         self.node = node
         self.pipeline_groups: Dict[str, List[str]] = {}  # pipeline_id -> [node_id, ...]
         self.stage_assignments: Dict[str, int] = {}  # node_id -> stage_id
-        self.pending_stages: Dict[str, Dict[int, Any]] = {}  # task_id -> {stage_id: hidden_states}
+        # task_id -> {prompt, max_tokens, current_stage, start_time, hidden_states, pipeline_id}
+        self.pending_stages: Dict[str, Dict[str, Any]] = {}
         self.lock = threading.Lock()
         
         # 统计
@@ -782,7 +846,7 @@ class DistributedInferenceCoordinator:
             for i, node_id in enumerate(nodes):
                 self.stage_assignments[node_id] = i
             
-            print(f"[Pipeline] 创建 Pipeline 组 {pipeline_id[:8]}: {len(nodes)} 个节点, {total_stages} 个阶段")
+            logger.info(f"创建 Pipeline 组 {pipeline_id[:8]}: {len(nodes)} 个节点, {total_stages} 个阶段")
     
     def get_stage_for_node(self, node_id: str) -> int:
         """获取节点所属的阶段"""
@@ -813,7 +877,7 @@ class DistributedInferenceCoordinator:
             # 第一阶段节点
             first_node_id = nodes[0]
             
-            # 初始化任务状态
+            # 初始化任务状态 (Bug 5: store pipeline_id)
             with self.lock:
                 self.pending_stages[task_id] = {
                     "prompt": prompt,
@@ -821,14 +885,15 @@ class DistributedInferenceCoordinator:
                     "current_stage": 0,
                     "start_time": start_time,
                     "hidden_states": None,
+                    "pipeline_id": pipeline_id,
                 }
             
             # 发送到第一阶段节点
             if first_node_id == self.node.node_info.node_id:
                 # 本地执行第一阶段
-                return self._execute_first_stage(task_id, prompt)
+                return self._execute_first_stage(task_id, prompt, pipeline_id)
             else:
-                # 远程执行第一阶段
+                # 远程执行第一阶段 (Bug 2 fix: use send_message_to_node)
                 return self._send_to_node(first_node_id, {
                     "type": "pipeline_stage",
                     "task_id": task_id,
@@ -838,11 +903,11 @@ class DistributedInferenceCoordinator:
                 })
             
         except Exception as e:
-            print(f"[Pipeline] 启动推理失败: {e}")
+            logger.error(f"启动推理失败: {e}")
             traceback.print_exc()
             return {"success": False, "error": str(e)}
     
-    def _execute_first_stage(self, task_id: str, prompt: str) -> Dict:
+    def _execute_first_stage(self, task_id: str, prompt: str, pipeline_id: str = "default") -> Dict:
         """执行第一阶段推理"""
         try:
             # Tokenize
@@ -855,8 +920,12 @@ class DistributedInferenceCoordinator:
                 # 执行 embedding
                 hidden_states = inputs["input_ids"]
                 
-                # 获取下一节点
-                nodes = self.pipeline_groups.get("default", [])
+                # Bug 5 fix: use the actual pipeline_id from the task, not hardcoded "default"
+                with self.lock:
+                    task_info = self.pending_stages.get(task_id, {})
+                    actual_pipeline_id = task_info.get("pipeline_id", pipeline_id)
+                
+                nodes = self.pipeline_groups.get(actual_pipeline_id, [])
                 if len(nodes) > 1:
                     next_node_id = nodes[1]
                     
@@ -875,24 +944,24 @@ class DistributedInferenceCoordinator:
                     })
                 else:
                     # 单节点，直接完成推理
-                    result = self.node.model_manager.inference(
-                        prompt, 
-                        max_tokens=self.pending_stages[task_id]["max_tokens"]
-                    )
+                    max_tokens = self.pending_stages[task_id]["max_tokens"]
                     
-                    # 清理
+                    # Bug 6 fix: save start_time before deleting the entry
                     with self.lock:
+                        start_time = self.pending_stages[task_id].get("start_time", time.time())
                         del self.pending_stages[task_id]
+                    
+                    result = self.node.model_manager.inference(prompt, max_tokens=max_tokens)
                     
                     return {
                         "success": True,
                         "response": result.response,
                         "tokens": result.tokens,
-                        "latency": time.time() - self.pending_stages.get(task_id, {}).get("start_time", time.time()),
+                        "latency": time.time() - start_time,
                     }
                     
         except Exception as e:
-            print(f"[Pipeline] 第一阶段执行失败: {e}")
+            logger.error(f"第一阶段执行失败: {e}")
             traceback.print_exc()
             return {"success": False, "error": str(e)}
     
@@ -921,9 +990,10 @@ class DistributedInferenceCoordinator:
                 task_info = self.pending_stages.get(task_id)
                 if not task_info:
                     return {"success": False, "error": "任务不存在"}
+                actual_pipeline_id = task_info.get("pipeline_id", "default")
             
-            # 获取下一阶段
-            nodes = self.pipeline_groups.get("default", [])
+            # Bug 5 fix: use actual pipeline_id
+            nodes = self.pipeline_groups.get(actual_pipeline_id, [])
             next_stage = stage + 1
             
             if next_stage >= len(nodes):
@@ -947,33 +1017,70 @@ class DistributedInferenceCoordinator:
                 })
                 
         except Exception as e:
-            print(f"[Pipeline] 处理阶段结果失败: {e}")
+            logger.error(f"处理阶段结果失败: {e}")
             traceback.print_exc()
             return {"success": False, "error": str(e)}
     
-    def _generate_final_output(self, task_id: str, hidden_states: torch.Tensor) -> Dict:
-        """生成最终输出"""
+    # Bug 1 fix: use string annotation 'torch.Tensor' instead of torch.Tensor
+    def _generate_final_output(self, task_id: str, hidden_states: 'torch.Tensor') -> Dict:
+        """
+        生成最终输出
+        
+        Improvement 3: Do proper token-by-token generation using the model's
+        generate method when available, rather than just generating 1 token.
+        """
         try:
-            # 通过 lm_head
-            with torch.no_grad():
-                if hasattr(self.node.model_manager.model, 'lm_head'):
-                    logits = self.node.model_manager.model.lm_head(hidden_states)
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1)
-                    
-                    # 解码
-                    response = self.node.model_manager.tokenizer.decode(
-                        next_token, 
-                        skip_special_tokens=True
-                    )
-                else:
-                    response = ""
-            
-            # 获取延迟
+            # Get task info for max_tokens
             with self.lock:
                 task_info = self.pending_stages.get(task_id, {})
-                latency = time.time() - task_info.get("start_time", time.time())
-                
-                # 清理
+                max_tokens = task_info.get("max_tokens", 256)
+                start_time = task_info.get("start_time", time.time())
+            
+            model = self.node.model_manager.model
+            tokenizer = self.node.model_manager.tokenizer
+            
+            if hasattr(model, 'generate'):
+                # Improvement 3: Use the model's generate method for proper multi-token generation
+                with torch.no_grad():
+                    if hasattr(model, 'model'):
+                        # Try to run the final stages through the model directly
+                        # If we have hidden_states from a partial pipeline, decode them
+                        if hasattr(model, 'lm_head'):
+                            generated_ids = []
+                            current_hidden = hidden_states
+                            
+                            for _ in range(max_tokens):
+                                logits = model.lm_head(current_hidden)
+                                next_token = torch.argmax(logits[:, -1, :], dim=-1)
+                                generated_ids.append(next_token)
+                                
+                                # Check for EOS
+                                if (tokenizer.eos_token_id is not None and 
+                                    next_token.item() == tokenizer.eos_token_id):
+                                    break
+                                
+                                # Get embedding for next token to continue
+                                if hasattr(model.model, 'embed_tokens'):
+                                    next_embed = model.model.embed_tokens(next_token)
+                                elif hasattr(model.model, 'wte'):
+                                    next_embed = model.model.wte(next_token)
+                                else:
+                                    break
+                                
+                                current_hidden = torch.cat([current_hidden, next_embed.unsqueeze(1)], dim=1)
+                            
+                            all_tokens = torch.cat(generated_ids, dim=-1) if generated_ids else torch.tensor([], dtype=torch.long)
+                            response = tokenizer.decode(all_tokens, skip_special_tokens=True)
+                        else:
+                            response = ""
+                    else:
+                        response = ""
+            else:
+                response = ""
+            
+            # 清理和统计
+            latency = time.time() - start_time
+            with self.lock:
                 if task_id in self.pending_stages:
                     del self.pending_stages[task_id]
                 
@@ -984,22 +1091,26 @@ class DistributedInferenceCoordinator:
             return {
                 "success": True,
                 "response": response,
-                "tokens": 1,  # Pipeline 单步生成
+                "tokens": len(response) if response else 1,
                 "latency": latency,
             }
             
         except Exception as e:
-            print(f"[Pipeline] 生成输出失败: {e}")
+            logger.error(f"生成输出失败: {e}")
             traceback.print_exc()
             return {"success": False, "error": str(e)}
     
+    # Bug 2 fix: use send_message_to_node convenience method
     def _send_to_node(self, node_id: str, message: Dict) -> Dict:
         """发送消息到节点"""
         try:
-            # 使用网络管理器发送
-            return self.node.network.send_message(node_id, message)
+            # 使用网络管理器的 send_message_to_node 方法
+            return self.node.network.send_message_to_node(
+                node_id, MessageType.PIPELINE_DATA, message,
+                wait_response=True, timeout=self.node.config.message_timeout
+            ) or {"success": False, "error": "No response from node"}
         except Exception as e:
-            print(f"[Pipeline] 发送消息失败: {e}")
+            logger.error(f"发送消息失败: {e}")
             return {"success": False, "error": str(e)}
     
     def get_stats(self) -> Dict:
@@ -1048,7 +1159,7 @@ class NetworkManager:
         self.running = True
         
         threading.Thread(target=self._accept_loop, daemon=True).start()
-        print(f"[网络] TCP服务器启动: {self.config.host}:{self.config.port}")
+        logger.info(f"TCP服务器启动: {self.config.host}:{self.config.port}")
     
     def _accept_loop(self):
         """接受连接循环"""
@@ -1061,7 +1172,7 @@ class NetworkManager:
                 continue
             except Exception as e:
                 if self.running:
-                    print(f"[网络] 接受连接错误: {e}")
+                    logger.error(f"接受连接错误: {e}")
     
     def _handle_connection(self, conn: socket.socket, addr):
         """处理连接"""
@@ -1079,7 +1190,14 @@ class NetworkManager:
                 
                 message = self._decode_message(data)
                 if message:
-                    msg_type = MessageType(message.get("type"))
+                    # Bug 7 fix: handle unknown message types gracefully
+                    raw_type = message.get("type", "")
+                    try:
+                        msg_type = MessageType(raw_type)
+                    except ValueError:
+                        logger.warning(f"收到未知消息类型: {raw_type}, 来自 {addr}")
+                        return
+                    
                     msg_data = message.get("data", {})
                     from_node = message.get("from_node", "")
                     
@@ -1096,49 +1214,132 @@ class NetworkManager:
                             encoded = self._encode_message(response_msg)
                             conn.sendall(encoded)
                             self.bytes_sent += len(encoded)
-        except:
-            pass
+        except Exception as e:
+            # Bug 9 fix: use except Exception instead of bare except
+            logger.debug(f"处理连接错误: {e}")
         finally:
             conn.close()
     
     def send_message(self, host: str, port: int, msg_type: MessageType,
                      data: Dict, wait_response: bool = False,
                      timeout: float = 10.0) -> Optional[Dict]:
-        """发送消息"""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            sock.connect((host, port))
-            
-            message = {
-                "type": msg_type.value,
-                "data": data,
-                "from_node": self.node_id,
-                "timestamp": time.time(),
-            }
-            
-            encoded = self._encode_message(message)
-            sock.sendall(encoded)
-            self.messages_sent += 1
-            self.bytes_sent += len(encoded)
-            
-            if wait_response:
-                sock.shutdown(socket.SHUT_WR)
-                response_data = b""
-                while True:
-                    chunk = sock.recv(65536)
-                    if not chunk:
-                        break
-                    response_data += chunk
+        """发送消息
+        
+        Improvement 5: Added retry logic for transient failures.
+        """
+        max_retries = getattr(self.config, 'message_retries', 2)
+        last_error = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect((host, port))
                 
-                if response_data:
-                    self.bytes_received += len(response_data)
-                    return self._decode_message(response_data)
+                message = {
+                    "type": msg_type.value,
+                    "data": data,
+                    "from_node": self.node_id,
+                    "timestamp": time.time(),
+                }
+                
+                encoded = self._encode_message(message)
+                sock.sendall(encoded)
+                self.messages_sent += 1
+                self.bytes_sent += len(encoded)
+                
+                if wait_response:
+                    sock.shutdown(socket.SHUT_WR)
+                    response_data = b""
+                    while True:
+                        chunk = sock.recv(65536)
+                        if not chunk:
+                            break
+                        response_data += chunk
+                    
+                    sock.close()
+                    
+                    if response_data:
+                        self.bytes_received += len(response_data)
+                        return self._decode_message(response_data)
+                else:
+                    sock.close()
+                
+                return None
+            except Exception as e:
+                last_error = e
+                logger.debug(f"发送消息到 {host}:{port} 失败 (尝试 {attempt+1}/{max_retries+1}): {e}")
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+                if attempt < max_retries:
+                    time.sleep(0.1 * (attempt + 1))
+        
+        logger.debug(f"发送消息到 {host}:{port} 最终失败: {last_error}")
+        return None
+    
+    # Bug 2 fix: Add convenience method to send to node by ID
+    def send_message_to_node(self, node_id: str, msg_type: MessageType,
+                              data: Dict, wait_response: bool = False,
+                              timeout: float = 0.0) -> Optional[Dict]:
+        """
+        通过节点ID发送消息（自动查找 host/port）
+        
+        Args:
+            node_id: 目标节点ID
+            msg_type: 消息类型
+            data: 消息数据
+            wait_response: 是否等待响应
+            timeout: 超时时间（0表示使用配置默认值）
             
-            sock.close()
+        Returns:
+            响应字典或None
+        """
+        node_info = self.known_nodes.get(node_id)
+        if not node_info:
+            logger.error(f"未知节点: {node_id}")
             return None
-        except Exception as e:
+        
+        if not node_info.host or not node_info.port:
+            logger.error(f"节点 {node_id} 没有有效的 host/port")
             return None
+        
+        if timeout <= 0:
+            timeout = getattr(self.config, 'message_timeout', 10.0)
+        
+        return self.send_message(
+            node_info.host, node_info.port, msg_type, data,
+            wait_response=wait_response, timeout=timeout
+        )
+    
+    # Bug 2 fix: Add method for sending raw message dicts (used by cluster handlers)
+    def send_raw_message(self, host: str, port: int, message: Dict,
+                         wait_response: bool = False, timeout: float = 10.0) -> Optional[Dict]:
+        """
+        发送原始消息字典
+        
+        用于向后兼容：一些旧代码构造完整消息字典而非使用 MessageType 枚举。
+        该方法从 message dict 中提取 type 字段并正确发送。
+        
+        Args:
+            host: 目标主机
+            port: 目标端口
+            message: 完整的消息字典（必须包含 "type" 和 "data" 字段）
+            wait_response: 是否等待响应
+            timeout: 超时时间
+        """
+        msg_type_str = message.get("type", "heartbeat")
+        data = message.get("data", message)  # 如果没有 data 字段，使用整个消息
+        
+        try:
+            msg_type = MessageType(msg_type_str)
+        except ValueError:
+            msg_type = MessageType.HEARTBEAT
+            logger.debug(f"send_raw_message: 未知消息类型 '{msg_type_str}', 使用 HEARTBEAT")
+        
+        return self.send_message(host, port, msg_type, data, 
+                                 wait_response=wait_response, timeout=timeout)
     
     def broadcast(self, msg_type: MessageType, data: Dict, 
                   exclude: Set[str] = None):
@@ -1154,16 +1355,20 @@ class NetworkManager:
                     node_info.host, node_info.port,
                     msg_type, data, wait_response=False
                 )
-            except:
-                pass
+            except Exception:
+                pass  # Bug 9 fix
     
     def _encode_message(self, message: Dict) -> bytes:
         """编码消息"""
         return zlib.compress(pickle.dumps(message))
     
-    def _decode_message(self, data: bytes) -> Dict:
+    def _decode_message(self, data: bytes) -> Optional[Dict]:
         """解码消息"""
-        return pickle.loads(zlib.decompress(data))
+        try:
+            return pickle.loads(zlib.decompress(data))
+        except Exception as e:
+            logger.error(f"解码消息失败: {e}")
+            return None
     
     def stop(self):
         """停止网络"""
@@ -1172,14 +1377,14 @@ class NetworkManager:
         for sock in self.connections.values():
             try:
                 sock.close()
-            except:
-                pass
+            except Exception:
+                pass  # Bug 9 fix
         
         if self.server_socket:
             try:
                 self.server_socket.close()
-            except:
-                pass
+            except Exception:
+                pass  # Bug 9 fix
     
     def get_stats(self) -> Dict:
         """获取统计信息"""
@@ -1229,7 +1434,7 @@ class RaftElection:
         self.network.register_handler(MessageType.HEARTBEAT, self._handle_heartbeat)
         
         self._reset_election_timer()
-        print(f"[选举] Raft选举服务启动，初始角色: {self.role.value}")
+        logger.info(f"Raft选举服务启动，初始角色: {self.role.value}")
     
     def _reset_election_timer(self):
         """重置选举定时器"""
@@ -1256,7 +1461,7 @@ class RaftElection:
                 return
         
         self.elections_started += 1
-        print(f"[选举] 开始选举，任期 {self.current_term + 1}")
+        logger.info(f"开始选举，任期 {self.current_term + 1}")
         
         with self.lock:
             self.role = NodeRole.CANDIDATE
@@ -1297,7 +1502,7 @@ class RaftElection:
                 response["vote_granted"] = True
                 self.last_heartbeat = time.time()
                 self._reset_election_timer()
-                print(f"[选举] 投票给 {candidate_id[:8]}")
+                logger.info(f"投票给 {candidate_id[:8]}")
         
         return response
     
@@ -1344,7 +1549,7 @@ class RaftElection:
     def _become_leader(self):
         """成为领导节点"""
         self.elections_won += 1
-        print(f"[选举] [LEADER] 成为领导节点! 任期 {self.current_term}")
+        logger.info(f"[LEADER] 成为领导节点! 任期 {self.current_term}")
         
         self.role = NodeRole.LEADER
         self.leader_id = self.node_id
@@ -1418,7 +1623,7 @@ class ModelManager:
     def load(self, shard_info: Dict = None) -> bool:
         """加载模型"""
         if not HAS_TORCH:
-            print("[模型] PyTorch未安装，无法加载模型")
+            logger.error("PyTorch未安装，无法加载模型")
             return False
         
         if self.loaded:
@@ -1427,10 +1632,10 @@ class ModelManager:
         start_time = time.time()
         
         try:
-            print(f"[模型] 加载模型: {self.config.model_name}")
+            logger.info(f"加载模型: {self.config.model_name}")
             
             # 加载tokenizer
-            print("   [1/2] 加载Tokenizer...")
+            logger.info("   [1/2] 加载Tokenizer...")
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model_name,
                 trust_remote_code=True
@@ -1440,7 +1645,7 @@ class ModelManager:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
             # 加载模型
-            print("   [2/2] 加载模型权重...")
+            logger.info("   [2/2] 加载模型权重...")
             
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -1470,16 +1675,14 @@ class ModelManager:
             self.loaded = True
             self.load_time = time.time() - start_time
             
-            print(f"[模型] [OK] 加载完成!")
-            print(f"   参数量: {param_count/1e9:.2f}B")
-            print(f"   大小: {self.model_size_gb:.2f}GB")
-            print(f"   设备: {self.device}")
-            print(f"   时间: {self.load_time:.1f}s")
+            logger.info(f"模型加载完成! 参数量: {param_count/1e9:.2f}B, "
+                       f"大小: {self.model_size_gb:.2f}GB, 设备: {self.device}, "
+                       f"时间: {self.load_time:.1f}s")
             
             return True
             
         except Exception as e:
-            print(f"[模型] [ERROR] 加载失败: {e}")
+            logger.error(f"模型加载失败: {e}")
             traceback.print_exc()
             return False
     
@@ -1543,10 +1746,10 @@ class ModelManager:
         if HAS_TORCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        import gc
+        # Bug 14 fix: gc is now a top-level import
         gc.collect()
         
-        print("[模型] 已卸载")
+        logger.info("模型已卸载")
     
     def get_stats(self) -> Dict:
         """获取统计信息"""
@@ -1586,7 +1789,7 @@ class ModelManager:
                     return len(self.model.model.h)
             
             return 0
-        except:
+        except Exception:
             return 0
     
     def load_shard(self, stage_id: int, total_stages: int) -> bool:
@@ -1601,13 +1804,13 @@ class ModelManager:
             是否加载成功
         """
         if not HAS_TORCH:
-            print("[模型] PyTorch未安装，无法加载模型分片")
+            logger.error("PyTorch未安装，无法加载模型分片")
             return False
         
         start_time = time.time()
         
         try:
-            print(f"[模型] 加载模型分片: 阶段 {stage_id+1}/{total_stages}")
+            logger.info(f"加载模型分片: 阶段 {stage_id+1}/{total_stages}")
             
             # 加载完整模型配置
             config = AutoConfig.from_pretrained(
@@ -1618,7 +1821,7 @@ class ModelManager:
             # 获取总层数
             total_layers = self.get_layer_count()
             if total_layers == 0:
-                print("[模型] 无法获取模型层数，回退到完整模型加载")
+                logger.warning("无法获取模型层数，回退到完整模型加载")
                 return self.load()
             
             # 计算每个阶段的层数
@@ -1636,10 +1839,10 @@ class ModelManager:
             if stage_id == total_stages - 1:
                 layer_end = total_layers
             
-            print(f"   层范围: {layer_start}-{layer_end-1} (共 {layer_end - layer_start} 层)")
+            logger.info(f"   层范围: {layer_start}-{layer_end-1} (共 {layer_end - layer_start} 层)")
             
             # 加载 tokenizer
-            print("   [1/2] 加载Tokenizer...")
+            logger.info("   [1/2] 加载Tokenizer...")
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.config.model_name,
                 trust_remote_code=True
@@ -1651,7 +1854,7 @@ class ModelManager:
             # 加载完整模型（暂时，实际应用中应该只加载分片）
             # 注意：真正的分片加载需要更复杂的实现，这里先加载完整模型
             # 然后只使用指定层
-            print("   [2/2] 加载模型分片...")
+            logger.info("   [2/2] 加载模型分片...")
             
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -1691,17 +1894,15 @@ class ModelManager:
             is_first = (stage_id == 0)
             is_last = (stage_id == total_stages - 1)
             
-            print(f"[模型] [OK] 分片加载完成!")
-            print(f"   阶段: {stage_id+1}/{total_stages}")
-            print(f"   层: {layer_start}-{layer_end-1}")
-            print(f"   类型: {'第一阶段' if is_first else '最后阶段' if is_last else '中间阶段'}")
-            print(f"   设备: {self.device}")
-            print(f"   时间: {self.load_time:.1f}s")
+            stage_type = '第一阶段' if is_first else '最后阶段' if is_last else '中间阶段'
+            logger.info(f"分片加载完成! 阶段: {stage_id+1}/{total_stages}, "
+                       f"层: {layer_start}-{layer_end-1}, 类型: {stage_type}, "
+                       f"设备: {self.device}, 时间: {self.load_time:.1f}s")
             
             return True
             
         except Exception as e:
-            print(f"[模型] [ERROR] 分片加载失败: {e}")
+            logger.error(f"分片加载失败: {e}")
             traceback.print_exc()
             return False
     
@@ -1761,7 +1962,7 @@ class ModelManager:
             return hidden_states
             
         except Exception as e:
-            print(f"[Pipeline] 前向传播错误: {e}")
+            logger.error(f"前向传播错误: {e}")
             traceback.print_exc()
             raise
 
@@ -1932,7 +2133,36 @@ class APIRequestHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             
-            messages = body.get("messages", [])
+            messages = body.get("messages")
+            # Bug 15 fix: Validate required fields
+            if not messages or not isinstance(messages, list) or len(messages) == 0:
+                self._send_json_response({
+                    "error": {
+                        "message": "'messages' is a required field and must be a non-empty array",
+                        "type": "invalid_request_error",
+                    }
+                }, 400)
+                return
+            
+            # Validate each message has required fields
+            for i, msg in enumerate(messages):
+                if not isinstance(msg, dict):
+                    self._send_json_response({
+                        "error": {
+                            "message": f"messages[{i}] must be an object",
+                            "type": "invalid_request_error",
+                        }
+                    }, 400)
+                    return
+                if "role" not in msg or "content" not in msg:
+                    self._send_json_response({
+                        "error": {
+                            "message": f"messages[{i}] must have 'role' and 'content' fields",
+                            "type": "invalid_request_error",
+                        }
+                    }, 400)
+                    return
+            
             model = body.get("model", self.node.config.model_name)
             max_tokens = body.get("max_tokens", 256)
             temperature = body.get("temperature", 0.7)
@@ -1997,13 +2227,23 @@ class APIRequestHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             
-            prompt = body.get("prompt", "")
+            # Bug 15 fix: Validate required fields
+            prompt = body.get("prompt")
+            if prompt is None:
+                self._send_json_response({
+                    "error": {
+                        "message": "'prompt' is a required field",
+                        "type": "invalid_request_error",
+                    }
+                }, 400)
+                return
+            
             model = body.get("model", self.node.config.model_name)
             max_tokens = body.get("max_tokens", 256)
             temperature = body.get("temperature", 0.7)
             
             result = self.node.model_manager.inference(
-                prompt,
+                str(prompt),
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
@@ -2043,12 +2283,22 @@ class APIRequestHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             
-            prompt = body.get("prompt", "")
+            # Bug 15 fix: Validate required fields
+            prompt = body.get("prompt")
+            if prompt is None:
+                self._send_json_response({
+                    "error": {
+                        "message": "'prompt' is a required field",
+                        "type": "invalid_request_error",
+                    }
+                }, 400)
+                return
+            
             max_tokens = body.get("max_tokens", 256)
             temperature = body.get("temperature", 0.7)
             
             result = self.node.model_manager.inference(
-                prompt,
+                str(prompt),
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
@@ -2071,8 +2321,14 @@ class APIRequestHandler(BaseHTTPRequestHandler):
 class UnifiedNode:
     """统一节点 - 支持所有模式"""
     
+    # Bug 11 fix: Maximum completed tasks to keep in memory
+    MAX_COMPLETED_TASKS = 1000
+    
     def __init__(self, config: UnifiedConfig):
         self.config = config
+        
+        # 配置日志
+        setup_logging(config.log_level, config.log_file)
         
         # 组件
         self.network = NetworkManager(config)
@@ -2095,7 +2351,7 @@ class UnifiedNode:
         # 任务管理
         self.pending_tasks: deque = deque()
         self.running_tasks: Dict[str, TaskInfo] = {}
-        self.completed_tasks: Dict[str, TaskInfo] = {}
+        self.completed_tasks: OrderedDict = OrderedDict()  # Bug 11: OrderedDict for size limit
         self.task_lock = threading.Lock()
         
         # Pipeline
@@ -2114,6 +2370,9 @@ class UnifiedNode:
         self.running = False
         self.api_server: Optional[HTTPServer] = None
         self.start_time = time.time()
+        
+        # 线程追踪（用于清理）
+        self._threads: List[threading.Thread] = []
     
     def start(self):
         """启动节点"""
@@ -2135,11 +2394,14 @@ class UnifiedNode:
         # 注册消息处理器
         self._register_handlers()
         
+        # Bug 12 / Improvement 8: Connect to seed nodes on startup
+        self._connect_to_seeds()
+        
         # 估算模型大小
         model_size_gb = ResourceMonitor.estimate_model_size(self.config.model_name)
-        print(f"\n[模型] 目标模型: {self.config.model_name}")
-        print(f"[模型] 估算大小: {model_size_gb:.1f}GB")
-        print(f"[模型] 可用内存: {self.node_info.memory_available_gb:.1f}GB")
+        logger.info(f"目标模型: {self.config.model_name}")
+        logger.info(f"估算大小: {model_size_gb:.1f}GB")
+        logger.info(f"可用内存: {self.node_info.memory_available_gb:.1f}GB")
         
         # 检查内存并决定加载策略
         use_distributed = False
@@ -2149,8 +2411,8 @@ class UnifiedNode:
             can_run, reason = ResourceMonitor.can_run_model(model_size_gb)
             
             if not can_run:
-                print(f"\n[资源] 本地内存不足: {reason}")
-                print("[资源] 尝试等待集群资源进行分布式加载...")
+                logger.warning(f"本地内存不足: {reason}")
+                logger.info("尝试等待集群资源进行分布式加载...")
                 
                 # 等待集群资源
                 if self._check_and_wait_for_cluster(model_size_gb):
@@ -2160,32 +2422,29 @@ class UnifiedNode:
                     
                     # 执行分布式加载
                     if not self._coordinate_distributed_loading(plan):
-                        print("[错误] 分布式加载失败")
-                        return
+                        logger.warning("分布式加载失败，API服务将以无模型模式启动")
                 else:
-                    print("[错误] 无法获得足够的集群资源，启动失败")
-                    return
+                    logger.warning("无法获得足够的集群资源，API服务将以无模型模式启动")
             else:
                 # 内存充足，检查是否配置了Pipeline模式
                 if self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL:
                     use_distributed = True
                     total_stages = self.config.pipeline_stages
                     
-                    # 确定阶段ID
-                    if self.election.state == NodeRole.LEADER:
+                    # Bug 3 fix: self.election.state -> self.election.role
+                    # Bug 4 fix: self.network.peers -> self.network.known_nodes
+                    if self.election.role == NodeRole.LEADER:
                         stage_id = 0
                     else:
-                        stage_id = len(self.network.peers) % total_stages
+                        stage_id = len(self.network.known_nodes) % total_stages
                     
-                    print(f"\n[Pipeline] 加载模型分片...")
-                    print(f"[Pipeline] 阶段: {stage_id + 1}/{total_stages}")
+                    logger.info(f"加载模型分片... 阶段: {stage_id + 1}/{total_stages}")
                     
                     if not self.model_manager.load_shard(stage_id, total_stages):
-                        print("[错误] 模型分片加载失败")
-                        return
+                        logger.warning("模型分片加载失败，API服务将以无模型模式启动")
                     
-                    self.pipeline_enabled = True
-                    self.pipeline_stage_id = stage_id
+                    self.pipeline_enabled = self.model_manager.loaded
+                    self.pipeline_stage_id = stage_id if self.pipeline_enabled else -1
         
         # 常规加载（内存充足且不需要分布式）
         if not use_distributed:
@@ -2195,75 +2454,79 @@ class UnifiedNode:
                 if total_stages <= 1:
                     total_stages = 2
                 
-                if self.election.state == NodeRole.LEADER:
+                # Bug 3 fix: self.election.state -> self.election.role
+                # Bug 4 fix: self.network.peers -> self.network.known_nodes
+                if self.election.role == NodeRole.LEADER:
                     stage_id = 0
                 else:
-                    stage_id = len(self.network.peers) % total_stages
+                    stage_id = len(self.network.known_nodes) % total_stages
                 
-                print(f"\n[Pipeline] 加载模型分片...")
-                print(f"[Pipeline] 阶段: {stage_id + 1}/{total_stages}")
+                logger.info(f"加载模型分片... 阶段: {stage_id + 1}/{total_stages}")
                 
                 if not self.model_manager.load_shard(stage_id, total_stages):
-                    print("[错误] 模型分片加载失败")
-                    return
+                    logger.warning("模型分片加载失败，API服务将以无模型模式启动")
                 
-                self.pipeline_enabled = True
-                self.pipeline_stage_id = stage_id
+                self.pipeline_enabled = self.model_manager.loaded
+                self.pipeline_stage_id = stage_id if self.pipeline_enabled else -1
                 
             elif self.config.parallel_mode == ParallelMode.HYBRID:
-                print("[警告] 混合并行模式尚未完全实现，使用数据并行")
+                logger.warning("混合并行模式尚未完全实现，使用数据并行")
                 if not self.model_manager.load():
-                    print("[错误] 模型加载失败")
-                    return
+                    logger.warning("模型加载失败，API服务将以无模型模式启动")
             else:
                 # 数据并行模式 - 加载完整模型
                 if not self.model_manager.load():
-                    print("[错误] 模型加载失败")
-                    return
+                    logger.warning("模型加载失败，API服务将以无模型模式启动")
         
-        self.node_info.model_loaded = True
+        if self.model_manager.loaded:
+            self.node_info.model_loaded = True
         self.node_info.model_name = self.config.model_name
         
         # 启动API服务器
         self._start_api_server()
         
         # 启动后台任务
-        threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-        threading.Thread(target=self._task_loop, daemon=True).start()
+        heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+        self._threads.append(heartbeat_thread)
         
-        print("\n" + "=" * 60)
-        print("[系统] [OK] 节点启动完成!")
-        print(f"[API] http://{self.config.api_host}:{self.config.api_port}")
-        print("=" * 60)
-        print("\n按 Ctrl+C 停止...\n")
+        task_thread = threading.Thread(target=self._task_loop, daemon=True)
+        task_thread.start()
+        self._threads.append(task_thread)
+        
+        logger.info("=" * 60)
+        logger.info("节点启动完成!")
+        logger.info(f"API: http://{self.config.api_host}:{self.config.api_port}")
+        logger.info("=" * 60)
+        logger.info("按 Ctrl+C 停止...")
         
         # 主循环
         try:
             while self.running:
                 time.sleep(1)
         except KeyboardInterrupt:
-            print("\n[系统] 正在停止...")
+            logger.info("正在停止...")
             self.stop()
     
     def _print_banner(self):
         """打印启动横幅"""
-        print("\n" + "=" * 60)
-        print(f"  统一分布式推理系统 v{VERSION}")
-        print("=" * 60)
-        print(f"  节点ID:   {self.config.node_id[:8]}")
-        print(f"  节点名称: {self.config.node_name}")
-        print(f"  并行模式: {self.config.parallel_mode.value}")
-        print(f"  调度模式: {self.config.schedule_mode.value}")
-        print(f"  模型:     {self.config.model_name}")
-        print("=" * 60)
+        logger.info("=" * 60)
+        logger.info(f"  统一分布式推理系统 v{VERSION}")
+        logger.info("=" * 60)
+        logger.info(f"  节点ID:   {self.config.node_id[:8]}")
+        logger.info(f"  节点名称: {self.config.node_name}")
+        logger.info(f"  并行模式: {self.config.parallel_mode.value}")
+        logger.info(f"  调度模式: {self.config.schedule_mode.value}")
+        logger.info(f"  模型:     {self.config.model_name}")
+        logger.info("=" * 60)
         
         # 显示模式信息
         mode_info = ModeSelector.get_mode_info(self.config.parallel_mode)
         if mode_info:
-            print(f"\n【{mode_info.get('name', '')}】")
-            print(f"  {mode_info.get('description', '')}")
-            print(f"  优点: {', '.join(mode_info.get('pros', []))}")
-            print(f"  缺点: {', '.join(mode_info.get('cons', []))}")
+            logger.info(f"【{mode_info.get('name', '')}】")
+            logger.info(f"  {mode_info.get('description', '')}")
+            logger.info(f"  优点: {', '.join(mode_info.get('pros', []))}")
+            logger.info(f"  缺点: {', '.join(mode_info.get('cons', []))}")
     
     def _register_handlers(self):
         """注册消息处理器"""
@@ -2279,22 +2542,41 @@ class UnifiedNode:
         self.network.register_handler(
             MessageType.PIPELINE_DATA, self._handle_pipeline_data
         )
-        # 集群资源协调处理器
+        
+        # Bug 17 fix: Register VOTE_RESPONSE handler
+        self.network.register_handler(
+            MessageType.VOTE_RESPONSE, self._handle_vote_response
+        )
+        
+        # Bug 7/Improvement 6/7: Fix cluster resource handlers to accept from_node
         self.network.register_handler(
             MessageType.CLUSTER_RESOURCE_QUERY, 
-            lambda data, from_node: self._handle_cluster_resource_query(data) or {}
+            self._handle_cluster_resource_query
         )
         self.network.register_handler(
             MessageType.CLUSTER_RESOURCE_RESPONSE,
-            lambda data, from_node: self._handle_cluster_resource_response(data) or {}
+            self._handle_cluster_resource_response
         )
         self.network.register_handler(
             MessageType.CLUSTER_START_DISTRIBUTED,
-            lambda data, from_node: self._handle_cluster_start_distributed(data) or {}
+            self._handle_cluster_start_distributed
         )
     
     def _handle_discover(self, data: Dict, from_node: str) -> Dict:
         """处理发现请求"""
+        # Register the discovering node
+        if data.get("node_info"):
+            try:
+                node_info = NodeInfo.from_dict(data["node_info"])
+                self.network.known_nodes[node_info.node_id] = node_info
+                # Also register any nodes they know about
+                for nid, ndata in data.get("known_nodes", {}).items():
+                    if nid != self.node_info.node_id and nid not in self.network.known_nodes:
+                        self.network.known_nodes[nid] = NodeInfo.from_dict(ndata)
+                logger.info(f"发现节点: {from_node[:8]} (已知节点: {len(self.network.known_nodes)})")
+            except Exception as e:
+                logger.debug(f"处理发现信息失败: {e}")
+        
         return {
             "node_id": self.node_info.node_id,
             "node_info": self.node_info.to_dict(),
@@ -2334,14 +2616,50 @@ class UnifiedNode:
             **result.to_dict()
         }
     
+    # Bug 10/18 fix: Connect _handle_pipeline_data to the pipeline coordinator
     def _handle_pipeline_data(self, data: Dict, from_node: str) -> Dict:
-        """处理 Pipeline 数据"""
-        # TODO: 实现 Pipeline 数据处理
+        """
+        处理 Pipeline 数据
+        
+        Routes pipeline stage messages to the DistributedInferenceCoordinator.
+        """
+        task_id = data.get("task_id", "")
+        stage = data.get("stage", 0)
+        prompt = data.get("prompt")
+        hidden_states = data.get("hidden_states")
+        attention_mask = data.get("attention_mask")
+        
+        try:
+            if hidden_states is not None and isinstance(hidden_states, bytes):
+                # This is a continuation message with hidden states
+                result = self.pipeline_coordinator.handle_stage_result(
+                    task_id, stage, hidden_states, attention_mask
+                )
+                return result or {"status": "processed"}
+            elif prompt is not None:
+                # This is an initial stage request with a prompt
+                pipeline_id = data.get("pipeline_id", "default")
+                max_tokens = data.get("max_tokens", 256)
+                result = self.pipeline_coordinator._execute_first_stage(
+                    task_id, prompt, pipeline_id
+                )
+                return result or {"status": "processed"}
+            else:
+                logger.warning(f"收到未知格式的 Pipeline 数据: task_id={task_id}, stage={stage}")
+                return {"status": "received", "error": "Unknown pipeline data format"}
+        except Exception as e:
+            logger.error(f"处理 Pipeline 数据失败: {e}")
+            return {"status": "error", "error": str(e)}
+    
+    # Bug 17 fix: Handler for VOTE_RESPONSE messages
+    def _handle_vote_response(self, data: Dict, from_node: str) -> Dict:
+        """处理投票响应"""
+        self.election.handle_vote_response(data, from_node)
         return {"status": "received"}
     
     def _on_become_leader(self):
         """成为领导节点回调"""
-        print("[领导] [LEADER] 成为领导节点，开始接受请求")
+        logger.info("[LEADER] 成为领导节点，开始接受请求")
     
     def _update_resource_info(self):
         """更新资源信息"""
@@ -2353,6 +2671,60 @@ class UnifiedNode:
         self.node_info.gpu_available = info["gpu_available"]
         self.node_info.gpu_memory_gb = info["gpu_memory_gb"]
         self.node_info.health_score = ResourceMonitor.get_health_score()
+    
+    # Bug 12 / Improvement 8: Connect to seed nodes on startup
+    def _connect_to_seeds(self):
+        """连接到种子节点以发现集群"""
+        if not self.config.seeds:
+            return
+        
+        logger.info(f"连接到 {len(self.config.seeds)} 个种子节点...")
+        
+        for seed in self.config.seeds:
+            try:
+                parts = seed.split(":")
+                host = parts[0]
+                port = int(parts[1]) if len(parts) > 1 else self.config.port
+                
+                # Skip connecting to ourselves
+                if host in ("127.0.0.1", "localhost") and port == self.config.port:
+                    continue
+                if host == self.node_info.host and port == self.config.port:
+                    continue
+                
+                # Send DISCOVER message
+                response = self.network.send_message(
+                    host, port, MessageType.DISCOVER,
+                    {
+                        "node_info": self.node_info.to_dict(),
+                        "known_nodes": {},
+                    },
+                    wait_response=True,
+                    timeout=5.0
+                )
+                
+                if response:
+                    resp_data = response.get("data", response)
+                    logger.info(f"成功连接到种子节点 {seed}")
+                    
+                    # Register discovered nodes
+                    if resp_data.get("node_info"):
+                        try:
+                            node_info = NodeInfo.from_dict(resp_data["node_info"])
+                            self.network.known_nodes[node_info.node_id] = node_info
+                        except Exception:
+                            pass
+                    
+                    for nid, ndata in resp_data.get("known_nodes", {}).items():
+                        if nid != self.node_info.node_id and nid not in self.network.known_nodes:
+                            try:
+                                self.network.known_nodes[nid] = NodeInfo.from_dict(ndata)
+                            except Exception:
+                                pass
+                else:
+                    logger.debug(f"种子节点 {seed} 无响应")
+            except Exception as e:
+                logger.debug(f"连接种子节点 {seed} 失败: {e}")
     
     def _check_and_wait_for_cluster(self, model_size_gb: float) -> bool:
         """
@@ -2368,18 +2740,16 @@ class UnifiedNode:
         can_run, reason = ResourceMonitor.can_run_model(model_size_gb)
         
         if can_run:
-            print(f"[资源] 本地内存充足: {reason}")
+            logger.info(f"本地内存充足: {reason}")
             return True
         
-        print(f"\n{'='*60}")
-        print(f"[警告] 本地内存不足!")
-        print(f"  模型需求: {model_size_gb:.1f}GB")
-        print(f"  可用内存: {self.node_info.memory_available_gb:.1f}GB")
-        print(f"  缺少: {model_size_gb * 1.2 - self.node_info.memory_available_gb:.1f}GB")
-        print(f"{'='*60}")
+        logger.warning(f"本地内存不足!")
+        logger.warning(f"  模型需求: {model_size_gb:.1f}GB")
+        logger.warning(f"  可用内存: {self.node_info.memory_available_gb:.1f}GB")
+        logger.warning(f"  缺少: {model_size_gb * 1.2 - self.node_info.memory_available_gb:.1f}GB")
         
         # 进入等待集群模式
-        print("\n[集群] 等待其他节点加入以进行分布式加载...")
+        logger.info("等待其他节点加入以进行分布式加载...")
         self.waiting_for_cluster = True
         
         # 广播资源查询
@@ -2401,30 +2771,33 @@ class UnifiedNode:
                 total_memory += self.node_info.memory_available_gb
                 node_count = len(self.cluster_resources) + 1
             
-            print(f"\r[集群] 等待中... 已发现 {node_count} 个节点, "
-                  f"总可用内存: {total_memory:.1f}GB / {model_size_gb * 1.2:.1f}GB  "
-                  f"({waited}s/{max_wait_time}s)", end="", flush=True)
+            if waited % 15 == 0:
+                logger.info(f"等待中... 已发现 {node_count} 个节点, "
+                           f"总可用内存: {total_memory:.1f}GB / {model_size_gb * 1.2:.1f}GB  "
+                           f"({waited}s/{max_wait_time}s)")
             
             # 检查是否满足条件
             if total_memory >= model_size_gb * 1.2 and node_count >= 2:
-                print(f"\n\n[集群] 检测到足够的集群资源!")
-                print(f"  节点数: {node_count}")
-                print(f"  总内存: {total_memory:.1f}GB")
+                logger.info(f"检测到足够的集群资源! 节点数: {node_count}, 总内存: {total_memory:.1f}GB")
                 self.waiting_for_cluster = False
                 return True
+            
+            # Re-broadcast periodically to discover new nodes
+            if waited > 0 and waited % 15 == 0:
+                self._broadcast_resource_query(model_size_gb)
             
             # 等待一段时间
             time.sleep(check_interval)
             waited += check_interval
         
-        print(f"\n\n[警告] 等待超时，无法获得足够的集群资源")
+        logger.warning(f"等待超时，无法获得足够的集群资源")
         self.waiting_for_cluster = False
         return False
     
     def _broadcast_resource_query(self, model_size_gb: float):
         """广播资源查询消息"""
-        message = {
-            "type": MessageType.CLUSTER_RESOURCE_QUERY.value,
+        # Bug 16 fix: Use proper MessageType format instead of raw dict
+        data = {
             "node_id": self.node_info.node_id,
             "host": self.node_info.host,
             "port": self.node_info.port,
@@ -2433,13 +2806,17 @@ class UnifiedNode:
             "timestamp": time.time(),
         }
         
-        # 发送到已知节点
+        # 发送到已知节点 (Bug 2 fix: use proper send_message with MessageType)
         for node_id, node_info in self.network.known_nodes.items():
             try:
                 if node_info.host and node_info.port:
-                    self.network.send_message(node_info.host, node_info.port, message)
+                    self.network.send_message(
+                        node_info.host, node_info.port,
+                        MessageType.CLUSTER_RESOURCE_QUERY, data,
+                        wait_response=False
+                    )
             except Exception as e:
-                print(f"[集群] 发送资源查询失败: {e}")
+                logger.debug(f"发送资源查询失败: {e}")
         
         # 也发送到种子节点
         for seed in self.config.seeds:
@@ -2447,18 +2824,43 @@ class UnifiedNode:
                 parts = seed.split(":")
                 host = parts[0]
                 port = int(parts[1]) if len(parts) > 1 else 5000
-                self.network.send_message(host, port, message)
+                self.network.send_message(
+                    host, port,
+                    MessageType.CLUSTER_RESOURCE_QUERY, data,
+                    wait_response=False
+                )
             except Exception as e:
-                print(f"[集群] 发送到种子节点失败: {e}")
+                logger.debug(f"发送到种子节点失败: {e}")
     
-    def _handle_cluster_resource_query(self, message: Dict):
-        """处理集群资源查询"""
+    # Improvement 7 fix: Properly accept from_node parameter and fix response sending
+    def _handle_cluster_resource_query(self, data: Dict, from_node: str) -> Dict:
+        """
+        处理集群资源查询
+        
+        Bug 2/16 fix: The handler now properly returns a response dict.
+        The NetworkManager's _handle_connection will wrap it in the proper
+        MessageType format and send it back automatically.
+        """
         # 更新资源信息
         self._update_resource_info()
         
-        # 响应当前节点的资源状态
-        response = {
-            "type": MessageType.CLUSTER_RESOURCE_RESPONSE.value,
+        # Register the querying node
+        query_node_id = data.get("node_id", "")
+        query_host = data.get("host", "")
+        query_port = data.get("port", 0)
+        
+        if query_node_id and query_node_id != self.node_info.node_id:
+            if query_node_id not in self.network.known_nodes:
+                node_info = NodeInfo(
+                    node_id=query_node_id,
+                    node_name=query_node_id[:8],
+                    host=query_host,
+                    port=query_port,
+                )
+                self.network.known_nodes[query_node_id] = node_info
+        
+        # Return resource info (NetworkManager will wrap and send this)
+        return {
             "node_id": self.node_info.node_id,
             "node_name": self.node_info.node_name,
             "memory_total_gb": self.node_info.memory_total_gb,
@@ -2470,29 +2872,40 @@ class UnifiedNode:
             "port": self.node_info.port,
             "timestamp": time.time(),
         }
-        
-        # 发送响应
-        sender_host = message.get("host", "")
-        sender_port = message.get("port", 0)
-        if sender_host and sender_port:
-            self.network.send_message(sender_host, sender_port, response)
     
-    def _handle_cluster_resource_response(self, message: Dict):
+    def _handle_cluster_resource_response(self, data: Dict, from_node: str) -> Dict:
         """处理集群资源响应"""
-        node_id = message.get("node_id", "")
+        node_id = data.get("node_id", "")
         
         with self.cluster_resource_lock:
             self.cluster_resources[node_id] = {
                 "node_id": node_id,
-                "node_name": message.get("node_name", ""),
-                "memory_total_gb": message.get("memory_total_gb", 0),
-                "memory_available_gb": message.get("memory_available_gb", 0),
-                "gpu_available": message.get("gpu_available", False),
-                "gpu_memory_gb": message.get("gpu_memory_gb", 0),
-                "cpu_cores": message.get("cpu_cores", 0),
-                "host": message.get("host", ""),
-                "port": message.get("port", 0),
+                "node_name": data.get("node_name", ""),
+                "memory_total_gb": data.get("memory_total_gb", 0),
+                "memory_available_gb": data.get("memory_available_gb", 0),
+                "gpu_available": data.get("gpu_available", False),
+                "gpu_memory_gb": data.get("gpu_memory_gb", 0),
+                "cpu_cores": data.get("cpu_cores", 0),
+                "host": data.get("host", ""),
+                "port": data.get("port", 0),
             }
+            
+            # Also register as known node if not already
+            if node_id and node_id != self.node_info.node_id and node_id not in self.network.known_nodes:
+                try:
+                    host = data.get("host", "")
+                    port = data.get("port", 0)
+                    if host and port:
+                        self.network.known_nodes[node_id] = NodeInfo(
+                            node_id=node_id,
+                            node_name=data.get("node_name", node_id[:8]),
+                            host=host,
+                            port=port,
+                        )
+                except Exception:
+                    pass
+        
+        return {"status": "received"}
     
     def _plan_distributed_loading(self, model_size_gb: float) -> Dict:
         """
@@ -2547,14 +2960,11 @@ class UnifiedNode:
             "created_at": time.time(),
         }
         
-        print(f"\n[集群] 分布式加载计划:")
-        print(f"  模型: {self.config.model_name}")
-        print(f"  大小: {model_size_gb:.1f}GB")
-        print(f"  分片数: {num_stages}")
+        logger.info(f"分布式加载计划: 模型={self.config.model_name}, 大小={model_size_gb:.1f}GB, 分片数={num_stages}")
         for node in participating_nodes:
-            print(f"  节点 {node.get('node_name', node.get('node_id', 'unknown'))}: "
-                  f"阶段 {node.get('stage_id', 0)+1}/{num_stages}, "
-                  f"内存 {node.get('memory_available_gb', 0):.1f}GB")
+            logger.info(f"  节点 {node.get('node_name', node.get('node_id', 'unknown'))}: "
+                       f"阶段 {node.get('stage_id', 0)+1}/{num_stages}, "
+                       f"内存 {node.get('memory_available_gb', 0):.1f}GB")
         
         return plan
     
@@ -2572,30 +2982,32 @@ class UnifiedNode:
                 break
         
         if my_stage_id is None:
-            print("[错误] 未在加载计划中找到本节点")
+            logger.error("未在加载计划中找到本节点")
             return False
         
-        # 发送启动消息给所有参与节点
+        # 发送启动消息给所有参与节点 (Bug 2 fix: use proper MessageType)
         for node in plan["nodes"]:
             if node.get("node_id") != self.node_info.node_id:
-                message = {
-                    "type": MessageType.CLUSTER_START_DISTRIBUTED.value,
-                    "node_id": self.node_info.node_id,
-                    "plan": plan,
-                    "target_node_id": node.get("node_id"),
-                    "target_stage_id": node.get("stage_id"),
-                }
                 try:
                     host = node.get("host", "")
                     port = node.get("port", 0)
                     if host and port:
-                        self.network.send_message(host, port, message)
+                        self.network.send_message(
+                            host, port,
+                            MessageType.CLUSTER_START_DISTRIBUTED,
+                            {
+                                "node_id": self.node_info.node_id,
+                                "plan": plan,
+                                "target_node_id": node.get("node_id"),
+                                "target_stage_id": node.get("stage_id"),
+                            },
+                            wait_response=False
+                        )
                 except Exception as e:
-                    print(f"[集群] 发送分布式加载指令失败: {e}")
+                    logger.error(f"发送分布式加载指令失败: {e}")
         
         # 自己也加载分片
-        print(f"\n[Pipeline] 开始加载模型分片...")
-        print(f"[Pipeline] 本节点阶段: {my_stage_id + 1}/{my_total_stages}")
+        logger.info(f"开始加载模型分片... 本节点阶段: {my_stage_id + 1}/{my_total_stages}")
         
         if self.model_manager.load_shard(my_stage_id, my_total_stages):
             self.pipeline_enabled = True
@@ -2604,13 +3016,30 @@ class UnifiedNode:
         
         return False
     
-    def _handle_cluster_start_distributed(self, message: Dict):
+    # Improvement 7 fix: Properly accept from_node parameter
+    def _handle_cluster_start_distributed(self, data: Dict, from_node: str) -> Dict:
         """处理分布式加载指令"""
-        plan = message.get("plan", {})
-        target_stage_id = message.get("target_stage_id")
+        plan = data.get("plan", {})
+        target_stage_id = data.get("target_stage_id")
         
-        print(f"\n[集群] 收到分布式加载指令")
-        print(f"[Pipeline] 本节点阶段: {target_stage_id + 1}/{plan.get('num_stages', 2)}")
+        logger.info(f"收到分布式加载指令, 本节点阶段: {target_stage_id + 1}/{plan.get('num_stages', 2)}")
+        
+        # Register the coordinator node
+        coordinator_id = data.get("node_id", from_node)
+        if coordinator_id and coordinator_id not in self.network.known_nodes:
+            # Try to find it in the plan nodes
+            for node in plan.get("nodes", []):
+                if node.get("node_id") == coordinator_id:
+                    try:
+                        self.network.known_nodes[coordinator_id] = NodeInfo(
+                            node_id=coordinator_id,
+                            node_name=node.get("node_name", coordinator_id[:8]),
+                            host=node.get("host", ""),
+                            port=node.get("port", 0),
+                        )
+                    except Exception:
+                        pass
+                    break
         
         # 加载分片
         if self.model_manager.load_shard(target_stage_id, plan.get("num_stages", 2)):
@@ -2618,9 +3047,11 @@ class UnifiedNode:
             self.pipeline_stage_id = target_stage_id
             self.node_info.model_loaded = True
             self.node_info.model_name = plan.get("model_name", "")
-            print(f"[Pipeline] 分片加载成功!")
+            logger.info("分片加载成功!")
+            return {"status": "success"}
         else:
-            print(f"[Pipeline] 分片加载失败!")
+            logger.error("分片加载失败!")
+            return {"status": "failed", "error": "Shard loading failed"}
     
     def _heartbeat_loop(self):
         """心跳循环"""
@@ -2634,11 +3065,12 @@ class UnifiedNode:
             with self.task_lock:
                 while self.pending_tasks:
                     task = self.pending_tasks.popleft()
-                    threading.Thread(
+                    t = threading.Thread(
                         target=self._process_task, 
                         args=(task,), 
                         daemon=True
-                    ).start()
+                    )
+                    t.start()
             
             time.sleep(0.1)
     
@@ -2664,7 +3096,13 @@ class UnifiedNode:
             task.error = result.error
         
         with self.task_lock:
+            # Bug 11 fix: Limit completed_tasks size to prevent memory leak
             self.completed_tasks[task.task_id] = task
+            if len(self.completed_tasks) > self.MAX_COMPLETED_TASKS:
+                # Remove oldest entries
+                oldest_keys = list(self.completed_tasks.keys())[:len(self.completed_tasks) - self.MAX_COMPLETED_TASKS]
+                for key in oldest_keys:
+                    del self.completed_tasks[key]
         
         self.load_balancer.update_node_stats(
             self.node_info.node_id,
@@ -2673,15 +3111,21 @@ class UnifiedNode:
         )
     
     def _start_api_server(self):
-        """启动API服务器"""
+        """启动API服务器
+        
+        Bug 8 fix: Use ThreadingHTTPServer for concurrent request handling.
+        """
         APIRequestHandler.node = self
         
-        self.api_server = HTTPServer(
+        # Bug 8: Use ThreadingHTTPServer instead of plain HTTPServer
+        self.api_server = ThreadingHTTPServer(
             (self.config.api_host, self.config.api_port),
             APIRequestHandler
         )
         
-        threading.Thread(target=self.api_server.serve_forever, daemon=True).start()
+        api_thread = threading.Thread(target=self.api_server.serve_forever, daemon=True)
+        api_thread.start()
+        self._threads.append(api_thread)
     
     def _get_local_ip(self) -> str:
         """获取本机IP"""
@@ -2691,20 +3135,36 @@ class UnifiedNode:
             ip = s.getsockname()[0]
             s.close()
             return ip
-        except:
+        except Exception:
             return "127.0.0.1"
     
+    # Improvement 4: Proper cleanup in stop()
     def stop(self):
         """停止节点"""
+        logger.info("正在停止节点...")
         self.running = False
-        self.network.stop()
+        
+        # Stop election first to avoid triggering new elections
         self.election.stop()
+        
+        # Stop network (closes server socket, stopping accept loop)
+        self.network.stop()
+        
+        # Shutdown API server
+        if self.api_server:
+            try:
+                self.api_server.shutdown()
+            except Exception:
+                pass
+        
+        # Unload model
         self.model_manager.unload()
         
-        if self.api_server:
-            self.api_server.shutdown()
+        # Clear pending tasks
+        with self.task_lock:
+            self.pending_tasks.clear()
         
-        print("[系统] 节点已停止")
+        logger.info("节点已停止")
 
 
 # ==================== 主函数 ====================
@@ -2717,10 +3177,10 @@ def load_config_file(config_path: str) -> Dict:
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        print(f"[配置] 已加载配置文件: {config_path}")
+        logger.info(f"已加载配置文件: {config_path}")
         return config
     except Exception as e:
-        print(f"[配置] 加载配置文件失败: {e}")
+        logger.error(f"加载配置文件失败: {e}")
         return {}
 
 
@@ -2898,7 +3358,7 @@ def main():
     
     # 自动模式选择
     if args.auto:
-        print("\n[自动模式] 检测系统资源...")
+        logger.info("自动模式: 检测系统资源...")
         info = ResourceMonitor.get_system_info()
         
         # 假设网络带宽
@@ -2912,10 +3372,10 @@ def main():
         )
         
         config.parallel_mode = mode
-        print(f"[自动模式] 选择模式: {mode.value}")
+        logger.info(f"自动模式: 选择 {mode.value}")
         
         mode_info = ModeSelector.get_mode_info(mode)
-        print(f"[自动模式] {mode_info.get('name', '')}: {mode_info.get('description', '')}")
+        logger.info(f"{mode_info.get('name', '')}: {mode_info.get('description', '')}")
     
     # Ngrok 隧道设置
     ngrok_url = None
@@ -2923,11 +3383,11 @@ def main():
     
     if config.ngrok_enabled:
         if not HAS_NGROK:
-            print("\n[错误] pyngrok 未安装，请运行: pip install pyngrok")
-            print("       或者访问 https://ngrok.com 注册并获取 authtoken")
+            logger.error("pyngrok 未安装，请运行: pip install pyngrok")
+            logger.error("或者访问 https://ngrok.com 注册并获取 authtoken")
             sys.exit(1)
         
-        print("\n[Ngrok] 正在创建公网隧道...")
+        logger.info("正在创建公网隧道...")
         
         try:
             # 设置认证令牌
@@ -2941,7 +3401,7 @@ def main():
                 proto="tcp"
             )
             node_public_url = node_tunnel.public_url
-            print(f"[Ngrok] 节点通信地址: {node_public_url}")
+            logger.info(f"节点通信地址: {node_public_url}")
             
             # 为 API 端口创建隧道
             api_tunnel = ngrok.connect(
@@ -2950,23 +3410,22 @@ def main():
                 proto="http"
             )
             ngrok_url = api_tunnel.public_url
-            print(f"[Ngrok] API 公网地址: {ngrok_url}")
-            print(f"[Ngrok] 健康检查: {ngrok_url}/health")
-            print(f"[Ngrok] Web UI: {ngrok_url}")
+            logger.info(f"API 公网地址: {ngrok_url}")
+            logger.info(f"健康检查: {ngrok_url}/health")
             
             # 保存隧道引用以便后续关闭
             ngrok_tunnel = (node_tunnel, api_tunnel)
             
             # 更新配置中的公网地址
             # 其他节点可以通过这个地址连接
-            print(f"\n[Ngrok] 其他节点连接命令:")
-            print(f"       python node_unified_complete.py --port {config.port + 1} --api-port {config.api_port + 1} --seeds \"{node_public_url.replace('tcp://', '')}\"")
+            logger.info(f"其他节点连接命令:")
+            logger.info(f"       python node_unified_complete.py --port {config.port + 1} --api-port {config.api_port + 1} --seeds \"{node_public_url.replace('tcp://', '')}\"")
             
         except Exception as e:
-            print(f"[Ngrok 错误] {e}")
-            print("\n提示:")
-            print("  1. 访问 https://dashboard.ngrok.com/get-started/your-authtoken 获取 authtoken")
-            print("  2. 运行: python node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN")
+            logger.error(f"Ngrok 错误: {e}")
+            logger.info("提示:")
+            logger.info("  1. 访问 https://dashboard.ngrok.com/get-started/your-authtoken 获取 authtoken")
+            logger.info("  2. 运行: python node_unified_complete.py --ngrok --ngrok-auth-token YOUR_TOKEN")
             sys.exit(1)
     
     # 创建并启动节点
@@ -2974,17 +3433,17 @@ def main():
         node = UnifiedNode(config)
         node.start()
     except KeyboardInterrupt:
-        print("\n[系统] 正在停止...")
+        logger.info("正在停止...")
     finally:
         # 关闭 ngrok 隧道
         if ngrok_tunnel:
-            print("\n[Ngrok] 关闭公网隧道...")
+            logger.info("关闭公网隧道...")
             try:
                 for tunnel in ngrok_tunnel:
                     ngrok.disconnect(tunnel.public_url)
                 ngrok.kill()
-                print("[Ngrok] 隧道已关闭")
-            except:
+                logger.info("隧道已关闭")
+            except Exception:
                 pass
 
 

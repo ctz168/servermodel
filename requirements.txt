@@ -10,11 +10,11 @@
 # 核心依赖
 torch>=2.0.0
 transformers>=4.30.0
+sentencepiece>=0.1.99
 psutil>=5.9.0
 
 # 可选依赖（推荐）
 accelerate>=0.20.0
-sentencepiece>=0.1.99
 safetensors>=0.3.0
 
 # API 服务依赖
