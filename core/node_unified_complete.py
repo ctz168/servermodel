@@ -1129,6 +1129,20 @@ class DistributedInferenceCoordinator:
 class NetworkManager:
     """网络管理器"""
     
+    # Maps request MessageType enums to their corresponding response MessageType enums.
+    # Used in _handle_connection to generate the correct response type instead of
+    # blindly appending "_response" (which caused type mismatches like
+    # "request_vote_response" vs the correct MessageType.VOTE_RESPONSE = "vote_response").
+    RESPONSE_TYPE_MAP = {
+        MessageType.REQUEST_VOTE: MessageType.VOTE_RESPONSE,
+        MessageType.HEARTBEAT: MessageType.HEARTBEAT_RESPONSE,
+        MessageType.DISCOVER: MessageType.DISCOVER_RESPONSE,
+        MessageType.CLUSTER_RESOURCE_QUERY: MessageType.CLUSTER_RESOURCE_RESPONSE,
+        MessageType.HEALTH_CHECK: MessageType.HEALTH_RESPONSE,
+        MessageType.INFERENCE_REQUEST: MessageType.INFERENCE_RESPONSE,
+        MessageType.PIPELINE_INIT: MessageType.PIPELINE_ACK,
+    }
+    
     def __init__(self, config: UnifiedConfig):
         self.config = config
         self.node_id = config.node_id
@@ -1206,11 +1220,22 @@ class NetworkManager:
                         response = handler(msg_data, from_node)
                         
                         if response:
-                            response_msg = {
-                                "type": msg_type.value + "_response",
-                                "data": response,
-                                "from_node": self.node_id,
-                            }
+                            # Use RESPONSE_TYPE_MAP to look up the correct response
+                            # MessageType instead of blindly appending "_response".
+                            response_type = self.RESPONSE_TYPE_MAP.get(msg_type)
+                            if response_type:
+                                response_msg = {
+                                    "type": response_type.value,
+                                    "data": response,
+                                    "from_node": self.node_id,
+                                }
+                            else:
+                                # Fallback: append "_response" for unmapped types
+                                response_msg = {
+                                    "type": msg_type.value + "_response",
+                                    "data": response,
+                                    "from_node": self.node_id,
+                                }
                             encoded = self._encode_message(response_msg)
                             conn.sendall(encoded)
                             self.bytes_sent += len(encoded)
@@ -2561,6 +2586,12 @@ class UnifiedNode:
             MessageType.CLUSTER_START_DISTRIBUTED,
             self._handle_cluster_start_distributed
         )
+        
+        # CLUSTER_READY handler: when the leader determines resources are sufficient
+        self.network.register_handler(
+            MessageType.CLUSTER_READY,
+            self._handle_cluster_ready
+        )
     
     def _handle_discover(self, data: Dict, from_node: str) -> Dict:
         """处理发现请求"""
@@ -2658,8 +2689,179 @@ class UnifiedNode:
         return {"status": "received"}
     
     def _on_become_leader(self):
-        """成为领导节点回调"""
-        logger.info("[LEADER] 成为领导节点，开始接受请求")
+        """
+        成为领导节点回调
+        
+        When a node becomes leader, it should:
+        1. Collect resource info from all known nodes
+        2. If in auto_mode and the model needs distributed loading, coordinate it
+        3. Set up pipeline groups if enough nodes are available
+        4. Broadcast CLUSTER_READY to all nodes
+        """
+        logger.info("[LEADER] 成为领导节点，开始集群协调...")
+        
+        # Run coordination in a background thread to avoid blocking the heartbeat loop
+        threading.Thread(target=self._coordinate_as_leader, daemon=True).start()
+    
+    def _coordinate_as_leader(self):
+        """Leader coordination logic - runs in a background thread"""
+        try:
+            model_size_gb = ResourceMonitor.estimate_model_size(self.config.model_name)
+            logger.info(f"[LEADER] 目标模型: {self.config.model_name} (估算 {model_size_gb:.1f}GB)")
+            
+            # Step 1: Collect resources from known nodes
+            self.cluster_resources.clear()
+            self._collect_cluster_resources()
+            
+            # Step 2: Check if distributed loading is needed
+            can_run, reason = ResourceMonitor.can_run_model(model_size_gb)
+            node_count = len(self.cluster_resources) + 1  # +1 for self
+            
+            if can_run and not self.config.auto_mode:
+                logger.info(f"[LEADER] 本地内存充足，无需分布式加载 ({reason})")
+                # Still set up pipeline if configured
+                if self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL and node_count >= 2:
+                    self._setup_pipeline_groups(model_size_gb)
+                # Broadcast cluster ready anyway
+                self._broadcast_cluster_ready({"mode": "data_parallel", "reason": reason})
+                return
+            
+            if node_count < 2:
+                logger.info(f"[LEADER] 仅发现 {node_count} 个节点，无法分布式加载")
+                if can_run:
+                    self._broadcast_cluster_ready({"mode": "data_parallel", "reason": "single node"})
+                else:
+                    logger.warning("[LEADER] 资源不足且无其他节点，集群无法就绪")
+                return
+            
+            # Step 3: Check if we have enough total resources
+            with self.cluster_resource_lock:
+                total_memory = (
+                    self.node_info.memory_available_gb
+                    + sum(r.get("memory_available_gb", 0) for r in self.cluster_resources.values())
+                )
+            
+            needs_distributed = total_memory >= model_size_gb * 1.2 or not can_run
+            
+            if needs_distributed and self.config.auto_mode:
+                logger.info(f"[LEADER] 需要分布式加载: 总内存 {total_memory:.1f}GB / 需求 {model_size_gb * 1.2:.1f}GB")
+                
+                # Plan distributed loading
+                plan = self._plan_distributed_loading(model_size_gb)
+                
+                if plan and plan["num_stages"] >= 2:
+                    # Coordinate distributed loading
+                    self._coordinate_distributed_loading(plan)
+                    
+                    # Set up pipeline groups
+                    pipeline_id = str(uuid.uuid4())
+                    node_ids = [n["node_id"] for n in plan["nodes"]]
+                    self.pipeline_coordinator.setup_pipeline(
+                        pipeline_id, node_ids, plan["num_stages"]
+                    )
+                    
+                    # Broadcast CLUSTER_READY with pipeline info
+                    self._broadcast_cluster_ready({
+                        "mode": "pipeline_parallel",
+                        "pipeline_id": pipeline_id,
+                        "plan": plan,
+                    })
+                    return
+            
+            # Step 4: If we have enough nodes, set up pipeline anyway if configured
+            if self.config.parallel_mode == ParallelMode.PIPELINE_PARALLEL and node_count >= 2:
+                self._setup_pipeline_groups(model_size_gb)
+                self._broadcast_cluster_ready({"mode": "pipeline_parallel"})
+            else:
+                self._broadcast_cluster_ready({"mode": "data_parallel", "reason": "sufficient resources"})
+                
+        except Exception as e:
+            logger.error(f"[LEADER] 集群协调失败: {e}")
+            traceback.print_exc()
+    
+    def _collect_cluster_resources(self, timeout: float = 10.0):
+        """
+        向所有已知节点发送资源查询并收集响应
+        
+        Args:
+            timeout: 等待响应的超时时间（秒）
+        """
+        data = {
+            "node_id": self.node_info.node_id,
+            "host": self.node_info.host,
+            "port": self.node_info.port,
+            "model_name": self.config.model_name,
+            "model_size_gb": ResourceMonitor.estimate_model_size(self.config.model_name),
+            "timestamp": time.time(),
+        }
+        
+        # Send to known nodes
+        for node_id, node_info in list(self.network.known_nodes.items()):
+            try:
+                if node_info.host and node_info.port:
+                    self.network.send_message(
+                        node_info.host, node_info.port,
+                        MessageType.CLUSTER_RESOURCE_QUERY, data,
+                        wait_response=False,
+                    )
+            except Exception:
+                pass
+        
+        # Send to seed nodes
+        for seed in self.config.seeds:
+            try:
+                parts = seed.split(":")
+                host = parts[0]
+                port = int(parts[1]) if len(parts) > 1 else self.config.port
+                self.network.send_message(
+                    host, port,
+                    MessageType.CLUSTER_RESOURCE_QUERY, data,
+                    wait_response=False,
+                )
+            except Exception:
+                pass
+        
+        # Wait a bit for responses to arrive
+        time.sleep(min(timeout, 5.0))
+        
+        logger.info(f"[LEADER] 收集到 {len(self.cluster_resources)} 个节点的资源信息")
+    
+    def _setup_pipeline_groups(self, model_size_gb: float):
+        """设置 Pipeline 组"""
+        # Collect all nodes including self
+        all_nodes = [{
+            "node_id": self.node_info.node_id,
+            "host": self.node_info.host,
+            "port": self.node_info.port,
+            "memory_available_gb": self.node_info.memory_available_gb,
+        }]
+        all_nodes.extend(list(self.cluster_resources.values()))
+        
+        total_stages = min(len(all_nodes), self.config.pipeline_stages or len(all_nodes))
+        if total_stages < 2:
+            return
+        
+        pipeline_id = str(uuid.uuid4())
+        node_ids = [n["node_id"] for n in all_nodes[:total_stages]]
+        
+        self.pipeline_coordinator.setup_pipeline(pipeline_id, node_ids, total_stages)
+        logger.info(f"[LEADER] 设置 Pipeline 组: {total_stages} 个节点")
+    
+    def _broadcast_cluster_ready(self, ready_info: Dict):
+        """广播 CLUSTER_READY 消息到所有已知节点"""
+        data = {
+            "leader_id": self.node_info.node_id,
+            "term": self.election.current_term,
+            "model_name": self.config.model_name,
+            "ready_info": ready_info,
+            "timestamp": time.time(),
+        }
+        
+        # Set our own cluster_ready_event
+        self.cluster_ready_event.set()
+        
+        self.network.broadcast(MessageType.CLUSTER_READY, data, exclude={self.node_info.node_id})
+        logger.info(f"[LEADER] 已广播 CLUSTER_READY 到 {len(self.network.known_nodes)} 个节点 (模式: {ready_info.get('mode', 'unknown')})")
     
     def _update_resource_info(self):
         """更新资源信息"""
@@ -2837,9 +3039,12 @@ class UnifiedNode:
         """
         处理集群资源查询
         
-        Bug 2/16 fix: The handler now properly returns a response dict.
-        The NetworkManager's _handle_connection will wrap it in the proper
-        MessageType format and send it back automatically.
+        Bug 2 fix: The sender uses wait_response=False when broadcasting, so the
+        TCP connection is closed immediately after sending. We cannot rely on the
+        handler return mechanism (which tries to write on the now-closed connection).
+        Instead, we send a CLUSTER_RESOURCE_RESPONSE message back as a NEW message
+        to the querying node's host/port. We return None so _handle_connection
+        does not attempt to send on the closed socket.
         """
         # 更新资源信息
         self._update_resource_info()
@@ -2859,8 +3064,8 @@ class UnifiedNode:
                 )
                 self.network.known_nodes[query_node_id] = node_info
         
-        # Return resource info (NetworkManager will wrap and send this)
-        return {
+        # Build resource response and send it back as a NEW message
+        response_data = {
             "node_id": self.node_info.node_id,
             "node_name": self.node_info.node_name,
             "memory_total_gb": self.node_info.memory_total_gb,
@@ -2872,6 +3077,20 @@ class UnifiedNode:
             "port": self.node_info.port,
             "timestamp": time.time(),
         }
+        
+        if query_host and query_port:
+            try:
+                self.network.send_message(
+                    query_host, query_port,
+                    MessageType.CLUSTER_RESOURCE_RESPONSE,
+                    response_data,
+                    wait_response=False,
+                )
+            except Exception as e:
+                logger.debug(f"发送资源响应到 {query_host}:{query_port} 失败: {e}")
+        
+        # Return None so _handle_connection does NOT try to send on the closed socket
+        return None
     
     def _handle_cluster_resource_response(self, data: Dict, from_node: str) -> Dict:
         """处理集群资源响应"""
@@ -3018,7 +3237,14 @@ class UnifiedNode:
     
     # Improvement 7 fix: Properly accept from_node parameter
     def _handle_cluster_start_distributed(self, data: Dict, from_node: str) -> Dict:
-        """处理分布式加载指令"""
+        """
+        处理分布式加载指令
+        
+        Bug 2 fix: The coordinator sends with wait_response=False, so the
+        connection is closed after sending. Send any acknowledgment back as
+        a new CLUSTER_RESOURCE_RESPONSE message instead of returning from
+        the handler. Return None to avoid writing on the closed socket.
+        """
         plan = data.get("plan", {})
         target_stage_id = data.get("target_stage_id")
         
@@ -3026,38 +3252,169 @@ class UnifiedNode:
         
         # Register the coordinator node
         coordinator_id = data.get("node_id", from_node)
+        coordinator_host = ""
+        coordinator_port = 0
         if coordinator_id and coordinator_id not in self.network.known_nodes:
             # Try to find it in the plan nodes
             for node in plan.get("nodes", []):
                 if node.get("node_id") == coordinator_id:
+                    coordinator_host = node.get("host", "")
+                    coordinator_port = node.get("port", 0)
                     try:
                         self.network.known_nodes[coordinator_id] = NodeInfo(
                             node_id=coordinator_id,
                             node_name=node.get("node_name", coordinator_id[:8]),
-                            host=node.get("host", ""),
-                            port=node.get("port", 0),
+                            host=coordinator_host,
+                            port=coordinator_port,
                         )
                     except Exception:
                         pass
                     break
         
         # 加载分片
+        success = False
+        error_msg = ""
         if self.model_manager.load_shard(target_stage_id, plan.get("num_stages", 2)):
             self.pipeline_enabled = True
             self.pipeline_stage_id = target_stage_id
             self.node_info.model_loaded = True
             self.node_info.model_name = plan.get("model_name", "")
             logger.info("分片加载成功!")
-            return {"status": "success"}
+            success = True
         else:
             logger.error("分片加载失败!")
-            return {"status": "failed", "error": "Shard loading failed"}
+            error_msg = "Shard loading failed"
+        
+        # Send acknowledgment back as a new message (connection is already closed)
+        if coordinator_host and coordinator_port:
+            try:
+                self.network.send_message(
+                    coordinator_host, coordinator_port,
+                    MessageType.CLUSTER_RESOURCE_RESPONSE,
+                    {
+                        "node_id": self.node_info.node_id,
+                        "status": "success" if success else "failed",
+                        "error": error_msg,
+                        "model_loaded": self.model_manager.loaded,
+                        "timestamp": time.time(),
+                    },
+                    wait_response=False,
+                )
+            except Exception as e:
+                logger.debug(f"发送加载确认到 coordinator 失败: {e}")
+        
+        # Return None to avoid writing on closed socket
+        return None
     
     def _heartbeat_loop(self):
-        """心跳循环"""
+        """心跳循环 - 定期更新资源信息并广播发现消息"""
+        last_discovery_time = 0.0
+        discovery_interval = 30.0  # 每30秒广播一次发现消息
+        
         while self.running:
             self._update_resource_info()
+            
+            now = time.time()
+            
+            # Periodic discovery broadcast to seed nodes and known nodes
+            # This allows new nodes to find existing nodes and vice versa
+            if now - last_discovery_time >= discovery_interval:
+                last_discovery_time = now
+                self._broadcast_discovery()
+            
             time.sleep(self.config.health_check_interval)
+    
+    def _broadcast_discovery(self):
+        """广播发现消息到种子节点和已知节点，用于自动节点发现"""
+        discover_data = {
+            "node_info": self.node_info.to_dict(),
+            "known_nodes": {
+                nid: n.to_dict()
+                for nid, n in self.network.known_nodes.items()
+            },
+        }
+        
+        # Send to known nodes
+        for node_id, node_info in list(self.network.known_nodes.items()):
+            try:
+                if node_info.host and node_info.port:
+                    self.network.send_message(
+                        node_info.host, node_info.port,
+                        MessageType.DISCOVER, discover_data,
+                        wait_response=False,
+                    )
+            except Exception:
+                pass
+        
+        # Send to seed nodes (in case they haven't discovered us yet)
+        for seed in self.config.seeds:
+            try:
+                parts = seed.split(":")
+                host = parts[0]
+                port = int(parts[1]) if len(parts) > 1 else self.config.port
+                # Skip connecting to ourselves
+                if host in ("127.0.0.1", "localhost") and port == self.config.port:
+                    continue
+                if host == self.node_info.host and port == self.config.port:
+                    continue
+                self.network.send_message(
+                    host, port,
+                    MessageType.DISCOVER, discover_data,
+                    wait_response=False,
+                )
+            except Exception:
+                pass
+    
+    def _handle_cluster_ready(self, data: Dict, from_node: str) -> Dict:
+        """
+        处理 CLUSTER_READY 消息
+        
+        当 follower 收到 leader 发来的 CLUSTER_READY 时，
+        根据就绪信息决定如何加载模型分片。
+        """
+        leader_id = data.get("leader_id", from_node)
+        ready_info = data.get("ready_info", {})
+        mode = ready_info.get("mode", "data_parallel")
+        
+        logger.info(f"[FOLLOWER] 收到 CLUSTER_READY (来自 {leader_id[:8]}, 模式: {mode})")
+        
+        # Update leader info
+        self.election.leader_id = leader_id
+        
+        # Set the cluster ready event
+        self.cluster_ready_event.set()
+        
+        # If in pipeline mode and we have a plan, load our assigned shard
+        if mode == "pipeline_parallel":
+            plan = ready_info.get("plan", {})
+            if plan:
+                # Find our assignment in the plan
+                for node in plan.get("nodes", []):
+                    if node.get("node_id") == self.node_info.node_id:
+                        stage_id = node.get("stage_id", 0)
+                        total_stages = plan.get("num_stages", 2)
+                        
+                        logger.info(f"[FOLLOWER] 加载分配的分片: 阶段 {stage_id + 1}/{total_stages}")
+                        
+                        if self.model_manager.load_shard(stage_id, total_stages):
+                            self.pipeline_enabled = True
+                            self.pipeline_stage_id = stage_id
+                            self.node_info.model_loaded = True
+                            self.node_info.model_name = plan.get("model_name", self.config.model_name)
+                            logger.info("[FOLLOWER] 分片加载成功!")
+                        else:
+                            logger.error("[FOLLOWER] 分片加载失败!")
+                        break
+            
+            # Set up pipeline coordinator if we have a pipeline_id
+            pipeline_id = ready_info.get("pipeline_id")
+            if pipeline_id and plan:
+                node_ids = [n["node_id"] for n in plan.get("nodes", [])]
+                self.pipeline_coordinator.setup_pipeline(
+                    pipeline_id, node_ids, plan.get("num_stages", 2)
+                )
+        
+        return None
     
     def _task_loop(self):
         """任务处理循环"""
